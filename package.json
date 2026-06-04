@@ -27,6 +27,7 @@
     "check": "tsc --noEmit",
     "build": "bun build src/server.ts --compile --outfile dist/codex-copilot-bridge",
     "package:release": "bun run check && bun run scripts/package-release.ts",
+    "formula:update": "bun run scripts/update-homebrew-formula.ts",
     "install:bin": "bun run check && bun run build && bun run scripts/install.ts"
   },
   "devDependencies": {

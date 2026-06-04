@@ -77,3 +77,14 @@ OPENAI_API_KEY=dummy codex exec --skip-git-repo-check \
   -c 'model_providers.copilot_bridge={name="Copilot Bridge",base_url="http://127.0.0.1:18787/v1",env_key="OPENAI_API_KEY",wire_api="responses"}' \
   "Reply exactly: ok"
 ```
+
+## Release
+
+Releases are built by GitHub Actions when a `v*` tag is pushed. The workflow builds the macOS x64 tarball, creates the GitHub Release, and updates the `greatbody/homebrew-tap` formula.
+
+The repository needs a `GH_TOKEN_FOR_TAP` secret with write access to `greatbody/homebrew-tap`.
+
+```bash
+git tag v0.1.1
+git push origin v0.1.1
+```
