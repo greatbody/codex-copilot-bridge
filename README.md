@@ -24,6 +24,15 @@ Other operating systems, shells, and Codex versions have not been verified yet. 
 
 ## Install
 
+### Homebrew
+
+```bash
+brew tap greatbody/tap
+brew install codex-copilot-bridge
+```
+
+### From Source
+
 ```bash
 bun install
 bun run install:bin
