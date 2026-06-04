@@ -1,0 +1,38 @@
+#!/bin/zsh
+set -euo pipefail
+
+BRIDGE_URL="http://127.0.0.1:18787/v1/models"
+BRIDGE_LOG="${TMPDIR:-/tmp}/ghcodex-copilot-bridge.log"
+
+if ! command -v codex-copilot-bridge >/dev/null 2>&1; then
+  echo "ghcodex: codex-copilot-bridge not found in PATH" >&2
+  echo "ghcodex: run 'bun run install:bin' from the codex-copilot-bridge project" >&2
+  exit 1
+fi
+
+if ! command -v codex >/dev/null 2>&1; then
+  echo "ghcodex: codex not found in PATH" >&2
+  exit 1
+fi
+
+if ! curl -fsS --max-time 1 "$BRIDGE_URL" >/dev/null 2>&1; then
+  codex-copilot-bridge >>"$BRIDGE_LOG" 2>&1 &
+  bridge_pid=$!
+  for _ in {1..30}; do
+    if curl -fsS --max-time 1 "$BRIDGE_URL" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.2
+  done
+  if ! curl -fsS --max-time 1 "$BRIDGE_URL" >/dev/null 2>&1; then
+    echo "ghcodex: failed to start codex-copilot-bridge; log: $BRIDGE_LOG" >&2
+    kill "$bridge_pid" >/dev/null 2>&1 || true
+    exit 1
+  fi
+fi
+
+OPENAI_API_KEY="${OPENAI_API_KEY:-dummy}" exec codex \
+  -c model_provider='"copilot_bridge"' \
+  -c model='"gpt-5.4-mini"' \
+  -c 'model_providers.copilot_bridge={name="Copilot Bridge",base_url="http://127.0.0.1:18787/v1",env_key="OPENAI_API_KEY",wire_api="responses"}' \
+  "$@"

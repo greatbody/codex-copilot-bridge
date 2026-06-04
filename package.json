@@ -1,0 +1,35 @@
+{
+  "name": "codex-copilot-bridge",
+  "version": "0.1.0",
+  "description": "Local bridge for using GitHub Copilot models from Codex CLI through an existing OpenCode Copilot login.",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "github-copilot",
+    "opencode",
+    "llm",
+    "bridge"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/greatbody/codex-copilot-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/greatbody/codex-copilot-bridge/issues"
+  },
+  "homepage": "https://github.com/greatbody/codex-copilot-bridge#readme",
+  "type": "module",
+  "bin": {
+    "ghcodex": "./bin/ghcodex"
+  },
+  "scripts": {
+    "start": "bun run src/server.ts",
+    "check": "tsc --noEmit",
+    "build": "bun build src/server.ts --compile --outfile dist/codex-copilot-bridge",
+    "install:bin": "bun run check && bun run build && bun run scripts/install.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "latest"
+  }
+}
