@@ -11,7 +11,8 @@ await Bun.$`bun run build`
 await Bun.$`mkdir -p ${staging}/bin`
 await Bun.$`cp ${path.join(root, "dist", "codex-copilot-bridge")} ${staging}/bin/codex-copilot-bridge`
 await Bun.$`cp ${path.join(root, "bin", "ghcodex")} ${staging}/bin/ghcodex`
-await Bun.$`chmod +x ${staging}/bin/codex-copilot-bridge ${staging}/bin/ghcodex`
+await Bun.$`cp ${path.join(root, "bin", "ghcodex")} ${staging}/bin/claudex`
+await Bun.$`chmod +x ${staging}/bin/codex-copilot-bridge ${staging}/bin/ghcodex ${staging}/bin/claudex`
 await Bun.$`tar -C ${path.join(root, "dist")} -czf ${archive} ${target}`
 
 console.log(archive)

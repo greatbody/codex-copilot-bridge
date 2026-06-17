@@ -3,15 +3,45 @@ set -euo pipefail
 
 BRIDGE_URL="http://127.0.0.1:18787/v1/models"
 BRIDGE_LOG="${TMPDIR:-/tmp}/ghcodex-copilot-bridge.log"
+CODEX_MODELS_CACHE="${CODEX_HOME:-$HOME/.codex}/models_cache.json"
+WRAPPER_NAME="${0:t}"
+CODEX_BRIDGE_MODE="responses"
+CODEX_PROFILE_NAME="copilot"
+EXTRA_CODEX_ARGS=()
+
+if [[ "$WRAPPER_NAME" == "claudex" ]]; then
+  CODEX_BRIDGE_MODE="messages"
+  CODEX_PROFILE_NAME="claudex"
+  EXTRA_CODEX_ARGS=(-c web_search='"disabled"')
+fi
+
+CODEX_PROFILE_ARGS=(--profile "$CODEX_PROFILE_NAME")
+for arg in "$@"; do
+  if [[ "$arg" == "--profile" || "$arg" == "--profile="* || "$arg" == "-p" ]]; then
+    CODEX_PROFILE_ARGS=()
+    break
+  fi
+done
+
+case "${1:-}" in
+  login|logout|plugin|mcp-server|app-server|remote-control|app|completion|update|doctor|execpolicy|apply|a|cloud|cloud-tasks|responses-api-proxy|stdio-to-uds|exec-server|features)
+    CODEX_PROFILE_ARGS=()
+    ;;
+  debug)
+    if [[ "${2:-}" != "prompt-input" ]]; then
+      CODEX_PROFILE_ARGS=()
+    fi
+    ;;
+esac
 
 if ! command -v codex-copilot-bridge >/dev/null 2>&1; then
-  echo "ghcodex: codex-copilot-bridge not found in PATH" >&2
-  echo "ghcodex: run 'bun run install:bin' from the codex-copilot-bridge project" >&2
+  echo "$WRAPPER_NAME: codex-copilot-bridge not found in PATH" >&2
+  echo "$WRAPPER_NAME: run 'bun run install:bin' from the codex-copilot-bridge project" >&2
   exit 1
 fi
 
 if ! command -v codex >/dev/null 2>&1; then
-  echo "ghcodex: codex not found in PATH" >&2
+  echo "$WRAPPER_NAME: codex not found in PATH" >&2
   exit 1
 fi
 
@@ -25,14 +55,99 @@ if ! curl -fsS --max-time 1 "$BRIDGE_URL" >/dev/null 2>&1; then
     sleep 0.2
   done
   if ! curl -fsS --max-time 1 "$BRIDGE_URL" >/dev/null 2>&1; then
-    echo "ghcodex: failed to start codex-copilot-bridge; log: $BRIDGE_LOG" >&2
+    echo "$WRAPPER_NAME: failed to start codex-copilot-bridge; log: $BRIDGE_LOG" >&2
     kill "$bridge_pid" >/dev/null 2>&1 || true
     exit 1
   fi
 fi
 
+if command -v node >/dev/null 2>&1; then
+  BRIDGE_URL="$BRIDGE_URL" CODEX_MODELS_CACHE="$CODEX_MODELS_CACHE" CODEX_BRIDGE_MODE="$CODEX_BRIDGE_MODE" node --input-type=module <<'NODE' >/dev/null 2>&1 || true
+import fs from "node:fs"
+import path from "node:path"
+
+const bridgeURL = process.env.BRIDGE_URL
+const cachePath = process.env.CODEX_MODELS_CACHE
+const bridgeMode = process.env.CODEX_BRIDGE_MODE === "messages" ? "messages" : "responses"
+
+function modelKey(model) {
+  return typeof model?.slug === "string" ? model.slug : typeof model?.id === "string" ? model.id : undefined
+}
+
+function normalizedEndpoints(model) {
+  return Array.isArray(model?.supported_endpoints)
+    ? model.supported_endpoints.map((endpoint) => String(endpoint).trim().toLowerCase())
+    : []
+}
+
+function supportsResponses(model) {
+  const endpoints = normalizedEndpoints(model)
+  return endpoints.includes("/responses") || endpoints.includes("/v1/responses")
+}
+
+function supportsMessagesAdapter(model) {
+  const endpoints = normalizedEndpoints(model)
+  return !supportsResponses(model) && (endpoints.includes("/v1/messages") || endpoints.includes("/messages"))
+}
+
+const response = await fetch(bridgeURL)
+if (!response.ok) throw new Error(`models failed: ${response.status}`)
+const live = await response.json()
+const allLiveModels = Array.isArray(live?.models) ? live.models : Array.isArray(live?.data) ? live.data : []
+const liveModels = allLiveModels.filter((model) => bridgeMode === "messages" ? supportsMessagesAdapter(model) : supportsResponses(model))
+
+let cache = {}
+try {
+  cache = JSON.parse(fs.readFileSync(cachePath, "utf8"))
+} catch {
+  cache = {}
+}
+
+const existingModels = Array.isArray(cache.models) ? cache.models : []
+const existingByKey = new Map(existingModels.flatMap((model) => {
+  const key = modelKey(model)
+  return key ? [[key, model]] : []
+}))
+const fallbackTemplate = existingModels[0]
+const mergedByKey = new Map()
+
+for (const liveModel of liveModels) {
+  const key = modelKey(liveModel)
+  if (!key) continue
+  const existing = existingByKey.get(key)
+  const supportsMessages = supportsMessagesAdapter(liveModel)
+  mergedByKey.set(key, {
+    ...(fallbackTemplate ?? {}),
+    ...(existing ?? {}),
+    ...liveModel,
+    slug: key,
+    id: typeof liveModel.id === "string" ? liveModel.id : key,
+    display_name: liveModel.display_name ?? liveModel.name ?? key,
+    description: liveModel.description ?? liveModel.display_name ?? liveModel.name ?? key,
+    visibility: liveModel.visibility ?? "list",
+    supported_in_api: liveModel.supported_in_api ?? true,
+    priority: typeof liveModel.priority === "number" ? liveModel.priority : typeof existing?.priority === "number" ? existing.priority : 50,
+    supports_search_tool: supportsMessages ? false : existing?.supports_search_tool ?? fallbackTemplate?.supports_search_tool ?? true,
+    web_search_tool_type: supportsMessages ? undefined : existing?.web_search_tool_type ?? fallbackTemplate?.web_search_tool_type ?? "text_and_image",
+  })
+}
+
+const updated = {
+  ...cache,
+  fetched_at: new Date().toISOString(),
+  models: Array.from(mergedByKey.values()),
+}
+
+fs.mkdirSync(path.dirname(cachePath), { recursive: true })
+const tempPath = `${cachePath}.${process.pid}.tmp`
+fs.writeFileSync(tempPath, `${JSON.stringify(updated, null, 2)}\n`)
+fs.renameSync(tempPath, cachePath)
+NODE
+fi
+
 OPENAI_API_KEY="${OPENAI_API_KEY:-dummy}" exec codex \
+  "${CODEX_PROFILE_ARGS[@]}" \
   -c model_provider='"copilot_bridge"' \
-  -c model='"gpt-5.4-mini"' \
   -c 'model_providers.copilot_bridge={name="Copilot Bridge",base_url="http://127.0.0.1:18787/v1",env_key="OPENAI_API_KEY",wire_api="responses"}' \
+  "${EXTRA_CODEX_ARGS[@]}" \
   "$@"

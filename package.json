@@ -20,7 +20,8 @@
   "homepage": "https://github.com/greatbody/codex-copilot-bridge#readme",
   "type": "module",
   "bin": {
-    "ghcodex": "./bin/ghcodex"
+    "ghcodex": "./bin/ghcodex",
+    "claudex": "./bin/ghcodex"
   },
   "scripts": {
     "start": "bun run src/server.ts",
