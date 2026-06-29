@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { buildCodexModels, clearCopilotModelsCache, loadCopilotModels, selectCopilotEndpoint } from "../src/copilot"
+import { sanitizeResponsesBody } from "../src/responses-sanitize"
 
 describe("selectCopilotEndpoint", () => {
   test("prefers native /responses when available", () => {
@@ -119,5 +120,37 @@ describe("buildCodexModels", () => {
     ])
 
     expect(models.map((item) => item.id)).toEqual(["messages"])
+  })
+})
+
+describe("sanitizeResponsesBody", () => {
+  test("removes unsupported Codex internal metadata fields from input items", () => {
+    const body = sanitizeResponsesBody(
+      JSON.stringify({
+        model: "gpt-5.5",
+        input: [
+          {
+            role: "user",
+            content: "hello",
+            internal_chat_message_metadata_passthrough: { hidden: true },
+          },
+        ],
+      }),
+    )
+
+    expect(JSON.parse(body)).toEqual({
+      model: "gpt-5.5",
+      input: [{ role: "user", content: "hello" }],
+    })
+  })
+
+  test("keeps existing image generation tool filtering", () => {
+    const body = sanitizeResponsesBody(
+      JSON.stringify({
+        tools: [{ type: "web_search" }, { type: "image_generation" }],
+      }),
+    )
+
+    expect(JSON.parse(body).tools).toEqual([{ type: "web_search" }])
   })
 })

@@ -1,6 +1,7 @@
 import path from "node:path"
 import { anthropicStreamToResponsesStream, anthropicToResponses, responsesToAnthropicMessages } from "./anthropic-adapter"
 import { buildCodexModels, loadCopilotModels, selectCopilotEndpoint, type CodexModelTemplate, type CopilotModel } from "./copilot"
+import { sanitizeResponsesBody } from "./responses-sanitize"
 
 const port = Number(process.env.PORT || 18787)
 const baseURL = "https://api.githubcopilot.com"
@@ -51,14 +52,6 @@ function json(data: unknown, status = 200, headers?: HeadersInit) {
 async function codexModelTemplates(available: CopilotModel[]) {
   const cache = (await Bun.file(codexModelsCacheFile).json().catch(() => undefined)) as CodexModelCache | undefined
   return buildCodexModels(available, cache?.models ?? [])
-}
-
-function sanitizeResponsesBody(raw: string) {
-  const body = JSON.parse(raw) as { tools?: Array<{ type?: string }>; [key: string]: unknown }
-  if (Array.isArray(body.tools)) {
-    body.tools = body.tools.filter((tool) => tool.type !== "image_generation")
-  }
-  return JSON.stringify(body)
 }
 
 async function fetchCopilotModels() {
