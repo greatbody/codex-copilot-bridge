@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { buildCodexModels, clearCopilotModelsCache, loadCopilotModels, selectCopilotEndpoint } from "../src/copilot"
-import { sanitizeResponsesBody } from "../src/responses-sanitize"
+import { rewriteCopilotFastResponsesRequest, sanitizeResponsesBody } from "../src/responses-sanitize"
 
 describe("selectCopilotEndpoint", () => {
   test("prefers native /responses when available", () => {
@@ -152,5 +152,37 @@ describe("sanitizeResponsesBody", () => {
     )
 
     expect(JSON.parse(body).tools).toEqual([{ type: "web_search" }])
+  })
+})
+
+describe("rewriteCopilotFastResponsesRequest", () => {
+  test.each(["fast", "priority", "ultrafast"])("routes GPT-5.6 Sol %s requests through Copilot's fast model ID", (serviceTier) => {
+    expect(
+      rewriteCopilotFastResponsesRequest({
+        model: "gpt-5.6-sol",
+        service_tier: serviceTier,
+        input: "hello",
+      }),
+    ).toEqual({
+      model: "gpt-5.6-sol-fast",
+      input: "hello",
+    })
+  })
+
+  test.each(["fast", "priority", "ultrafast"])("removes %s from an explicitly selected Copilot fast model", (serviceTier) => {
+    expect(
+      rewriteCopilotFastResponsesRequest({
+        model: "gpt-5.6-sol-fast",
+        service_tier: serviceTier,
+      }),
+    ).toEqual({ model: "gpt-5.6-sol-fast" })
+  })
+
+  test("does not rewrite other tiers or model families", () => {
+    const standard = { model: "gpt-5.6-sol", service_tier: "default" }
+    const terra = { model: "gpt-5.6-terra", service_tier: "ultrafast" }
+
+    expect(rewriteCopilotFastResponsesRequest(standard)).toBe(standard)
+    expect(rewriteCopilotFastResponsesRequest(terra)).toBe(terra)
   })
 })

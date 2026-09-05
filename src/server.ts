@@ -1,7 +1,7 @@
 import path from "node:path"
 import { anthropicStreamToResponsesStream, anthropicToResponses, responsesToAnthropicMessages } from "./anthropic-adapter"
 import { buildCodexModels, loadCopilotModels, selectCopilotEndpoint, type CodexModelTemplate, type CopilotModel } from "./copilot"
-import { sanitizeResponsesBody } from "./responses-sanitize"
+import { rewriteCopilotFastResponsesRequest, sanitizeResponsesBody } from "./responses-sanitize"
 
 const port = Number(process.env.PORT || 18787)
 const baseURL = "https://api.githubcopilot.com"
@@ -91,6 +91,7 @@ Bun.serve({
       } catch {
         return json({ error: { message: "Request body must be valid JSON." } }, 400)
       }
+      body = rewriteCopilotFastResponsesRequest(body)
 
       let models: CopilotModel[]
       try {
@@ -143,7 +144,7 @@ Bun.serve({
           "content-type": request.headers.get("content-type") || "application/json",
           accept: request.headers.get("accept") || "text/event-stream",
         },
-        body: sanitizeResponsesBody(rawBody),
+        body: sanitizeResponsesBody(JSON.stringify(body)),
       })
       const headers = new Headers(response.headers)
       headers.delete("content-encoding")

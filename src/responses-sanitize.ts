@@ -1,5 +1,19 @@
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue }
 
+type ResponsesBody = {
+  model?: unknown
+  service_tier?: unknown
+  [key: string]: unknown
+}
+
+export function rewriteCopilotFastResponsesRequest(body: ResponsesBody): ResponsesBody {
+  if (body.service_tier !== "fast" && body.service_tier !== "priority" && body.service_tier !== "ultrafast") return body
+  if (body.model !== "gpt-5.6-sol" && body.model !== "gpt-5.6-sol-fast") return body
+
+  const { service_tier: _serviceTier, ...rewritten } = body
+  return { ...rewritten, model: "gpt-5.6-sol-fast" }
+}
+
 function stripUnsupportedResponsesFields(value: JsonValue): JsonValue {
   if (Array.isArray(value)) {
     return value.map(stripUnsupportedResponsesFields)

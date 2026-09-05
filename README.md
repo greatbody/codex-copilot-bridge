@@ -64,6 +64,8 @@ Codex should be configured with `wire_api="responses"`. For each `POST /v1/respo
 - Models that do not advertise `/responses` but do advertise `/v1/messages` are handled by the local Claude Messages adapter. This is Responses compatibility via translation, not native Claude Responses support.
 - Models that advertise neither endpoint return a JSON error explaining the supported endpoints reported by Copilot.
 
+For `gpt-5.6-sol`, Codex `service_tier="fast"`, `"priority"`, and `"ultrafast"` requests are routed to Copilot's `gpt-5.6-sol-fast` model ID with the unsupported `service_tier` field removed. Copilot serves this route as Fast/Priority processing; the bridge does not claim native Ultrafast service from Copilot.
+
 The Claude adapter currently supports non-streaming responses and streaming text/tool-call events. It maps common Codex Responses fields into Anthropic Messages:
 
 - `model`
