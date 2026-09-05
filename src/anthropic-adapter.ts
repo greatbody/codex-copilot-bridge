@@ -1,10 +1,14 @@
+import { positiveInteger, reasoningEfforts, type CopilotModel } from "./copilot"
+
 type JsonObject = Record<string, unknown>
+export type ThinkingBlock = { type: "thinking"; thinking: string; signature: string } | { type: "redacted_thinking"; data: string }
 
 type AnthropicContentBlock =
   | { type: "text"; text: string }
   | { type: "image"; source: { type: "base64"; media_type: string; data: string } | { type: "url"; url: string } }
   | { type: "tool_use"; id: string; name: string; input: unknown }
   | { type: "tool_result"; tool_use_id: string; content: string | AnthropicContentBlock[]; is_error?: boolean }
+  | ThinkingBlock
 
 type AnthropicMessage = {
   role: "user" | "assistant"
@@ -23,6 +27,8 @@ export type AnthropicMessagesRequest = {
   top_p?: number
   metadata?: unknown
   stop_sequences?: string[]
+  thinking?: { type: "adaptive" | "disabled" } | { type: "enabled"; budget_tokens: number }
+  output_config?: { effort: string }
 }
 
 type AdapterResult<T> = { ok: true; value: T } | { ok: false; status: number; message: string }
@@ -224,7 +230,7 @@ function convertToolChoice(toolChoice: unknown): AdapterResult<AnthropicMessages
   return { ok: true, value: undefined }
 }
 
-export function responsesToAnthropicMessages(body: JsonObject): AdapterResult<AnthropicMessagesRequest> {
+export function responsesToAnthropicMessages(body: JsonObject, metadata: CopilotModel = {}): AdapterResult<AnthropicMessagesRequest> {
   if (typeof body.previous_response_id === "string" && body.previous_response_id.length > 0) {
     return {
       ok: false,
@@ -255,7 +261,11 @@ export function responsesToAnthropicMessages(body: JsonObject): AdapterResult<An
   if (system.length > 0) request.system = system.join("\n\n")
 
   const maxTokens = typeof body.max_output_tokens === "number" ? body.max_output_tokens : body.max_tokens
-  request.max_tokens = typeof maxTokens === "number" ? maxTokens : 4096
+  const outputLimit = positiveInteger(metadata.capabilities?.limits?.max_output_tokens)
+  if (maxTokens !== undefined && (!positiveInteger(maxTokens) || (outputLimit !== undefined && Number(maxTokens) > outputLimit))) {
+    return { ok: false, status: 400, message: "max_output_tokens must be a positive integer within the model output limit." }
+  }
+  request.max_tokens = positiveInteger(maxTokens) ?? outputLimit ?? 4096
   if (body.stream === true) request.stream = true
   if (tools.value) request.tools = tools.value
   if (toolChoice.value) request.tool_choice = toolChoice.value
@@ -264,6 +274,34 @@ export function responsesToAnthropicMessages(body: JsonObject): AdapterResult<An
   if (body.metadata !== undefined) request.metadata = body.metadata
   if (Array.isArray(body.stop)) request.stop_sequences = body.stop.filter((item): item is string => typeof item === "string")
   if (typeof body.stop === "string") request.stop_sequences = [body.stop]
+
+  const effort = isObject(body.reasoning) ? body.reasoning.effort : undefined
+  if (effort !== undefined && effort !== null) {
+    const efforts = reasoningEfforts(metadata, true)
+    if (typeof effort !== "string" || !efforts.includes(effort)) {
+      return { ok: false, status: 400, message: `Unsupported reasoning effort for ${model}. Supported: ${efforts.join(", ") || "none advertised"}.` }
+    }
+    if (effort === "none") {
+      request.thinking = { type: "disabled" }
+    } else if (metadata.capabilities?.supports?.adaptive_thinking) {
+      request.thinking = { type: "adaptive" }
+      request.output_config = { effort }
+    } else {
+      const maximum = Math.min(metadata.capabilities?.supports?.max_thinking_budget ?? 0, request.max_tokens)
+      const minimum = positiveInteger(metadata.capabilities?.supports?.min_thinking_budget) ?? 1024
+      if (maximum <= minimum) {
+        return { ok: false, status: 400, message: `max_output_tokens must exceed the minimum thinking budget (${minimum}).` }
+      }
+      request.thinking = { type: "enabled", budget_tokens: effort === "max" ? maximum - 1 : Math.max(minimum, Math.floor(maximum / 2)) }
+    }
+    if (request.thinking.type !== "disabled") {
+      if (request.tool_choice?.type === "any" || request.tool_choice?.type === "tool") {
+        return { ok: false, status: 400, message: "Forced tool_choice is incompatible with Claude thinking. Use auto." }
+      }
+      delete request.temperature
+      delete request.top_p
+    }
+  }
 
   return { ok: true, value: request }
 }
@@ -304,12 +342,10 @@ function responseOutputFromAnthropic(content: unknown): unknown[] {
   return output
 }
 
-export function anthropicToResponses(body: unknown, fallbackModel: string) {
+export function anthropicToResponses(body: unknown, fallbackModel: string, observe?: (content: unknown) => void) {
   const source = isObject(body) ? body : {}
+  observe?.(source.content)
   const usage = isObject(source.usage) ? source.usage : {}
-  const inputTokens = typeof usage.input_tokens === "number" ? usage.input_tokens : undefined
-  const outputTokens = typeof usage.output_tokens === "number" ? usage.output_tokens : undefined
-  const totalTokens = inputTokens !== undefined || outputTokens !== undefined ? (inputTokens ?? 0) + (outputTokens ?? 0) : undefined
 
   return {
     id: stringValue(source.id) ?? `resp_${crypto.randomUUID()}`,
@@ -330,11 +366,21 @@ export function anthropicToResponses(body: unknown, fallbackModel: string) {
     tools: [],
     top_p: null,
     truncation: "disabled",
-    usage: {
-      input_tokens: inputTokens,
-      output_tokens: outputTokens,
-      total_tokens: totalTokens,
-    },
+    usage: responseUsage(usage),
+  }
+}
+
+function responseUsage(usage: JsonObject = {}) {
+  const input = typeof usage.input_tokens === "number" ? usage.input_tokens : undefined
+  const cached = typeof usage.cache_read_input_tokens === "number" ? usage.cache_read_input_tokens : 0
+  const created = typeof usage.cache_creation_input_tokens === "number" ? usage.cache_creation_input_tokens : 0
+  const inputTokens = input !== undefined || cached || created ? (input ?? 0) + cached + created : undefined
+  const outputTokens = typeof usage.output_tokens === "number" ? usage.output_tokens : undefined
+  return {
+    input_tokens: inputTokens,
+    input_tokens_details: { cached_tokens: cached },
+    output_tokens: outputTokens,
+    total_tokens: inputTokens !== undefined || outputTokens !== undefined ? (inputTokens ?? 0) + (outputTokens ?? 0) : undefined,
   }
 }
 
@@ -372,12 +418,15 @@ function parseSSEFrame(frame: string) {
   }
 }
 
-export function anthropicStreamToResponsesStream(body: ReadableStream<Uint8Array> | null, fallbackModel: string) {
+export function anthropicStreamToResponsesStream(body: ReadableStream<Uint8Array> | null, fallbackModel: string, observe?: (content: unknown) => void) {
   const encoder = new TextEncoder()
   const decoder = new TextDecoder()
   const responseID = `resp_${crypto.randomUUID()}`
   const output: unknown[] = []
   const toolBlocks = new Map<number, { id: string; name: string; arguments: string; outputIndex: number }>()
+  const thinkingBlocks = new Map<number, ThinkingBlock>()
+  const nativeContent: unknown[] = []
+  const textBlocks = new Set<number>()
   let textOutputIndex: number | undefined
   let textContentIndex = 0
   let text = ""
@@ -414,7 +463,17 @@ export function anthropicStreamToResponsesStream(body: ReadableStream<Uint8Array
 
           if (data.type === "content_block_start" && typeof data.index === "number" && isObject(data.content_block)) {
             const block = data.content_block
+            if (block.type === "thinking") {
+              const thinking: ThinkingBlock = { type: "thinking", thinking: stringValue(block.thinking) ?? "", signature: stringValue(block.signature) ?? "" }
+              thinkingBlocks.set(data.index, thinking)
+              nativeContent.push(thinking)
+            }
+            if (block.type === "redacted_thinking" && typeof block.data === "string") {
+              nativeContent.push({ type: "redacted_thinking", data: block.data })
+            }
             if (block.type === "text") {
+              textBlocks.add(data.index)
+              text = ""
               textOutputIndex = output.length
               textContentIndex = 0
               const item = {
@@ -439,6 +498,7 @@ export function anthropicStreamToResponsesStream(body: ReadableStream<Uint8Array
               )
             }
             if (block.type === "tool_use") {
+              nativeContent.push(block)
               const outputIndex = output.length
               const tool = {
                 id: stringValue(block.id) ?? `call_${data.index}`,
@@ -462,6 +522,11 @@ export function anthropicStreamToResponsesStream(body: ReadableStream<Uint8Array
 
           if (data.type === "content_block_delta" && typeof data.index === "number" && isObject(data.delta)) {
             const delta = data.delta
+            const thinking = thinkingBlocks.get(data.index)
+            if (thinking?.type === "thinking") {
+              if (delta.type === "thinking_delta" && typeof delta.thinking === "string") thinking.thinking += delta.thinking
+              if (delta.type === "signature_delta" && typeof delta.signature === "string") thinking.signature += delta.signature
+            }
             if (delta.type === "text_delta" && typeof delta.text === "string" && textOutputIndex !== undefined) {
               text += delta.text
               const item = output[textOutputIndex]
@@ -514,7 +579,7 @@ export function anthropicStreamToResponsesStream(body: ReadableStream<Uint8Array
                 ),
               )
               controller.enqueue(encoder.encode(sse("response.output_item.done", { type: "response.output_item.done", output_index: tool.outputIndex, item })))
-            } else if (textOutputIndex !== undefined) {
+            } else if (textBlocks.has(data.index) && textOutputIndex !== undefined) {
               const item = output[textOutputIndex]
               if (isObject(item)) item.status = "completed"
               controller.enqueue(
@@ -545,8 +610,7 @@ export function anthropicStreamToResponsesStream(body: ReadableStream<Uint8Array
 
           if (data.type === "message_delta" && isObject(data.usage)) usage = { ...(usage ?? {}), ...data.usage }
           if (data.type === "message_stop") {
-            const inputTokens = typeof usage?.input_tokens === "number" ? usage.input_tokens : undefined
-            const outputTokens = typeof usage?.output_tokens === "number" ? usage.output_tokens : undefined
+            observe?.(nativeContent)
             controller.enqueue(
               encoder.encode(
                 sse("response.completed", {
@@ -558,12 +622,7 @@ export function anthropicStreamToResponsesStream(body: ReadableStream<Uint8Array
                     status: "completed",
                     model,
                     output,
-                    usage: {
-                      input_tokens: inputTokens,
-                      output_tokens: outputTokens,
-                      total_tokens:
-                        inputTokens !== undefined || outputTokens !== undefined ? (inputTokens ?? 0) + (outputTokens ?? 0) : undefined,
-                    },
+                    usage: responseUsage(usage),
                   },
                 }),
               ),

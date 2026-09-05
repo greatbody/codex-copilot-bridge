@@ -45,16 +45,16 @@ if ! command -v codex >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! curl -fsS --max-time 1 "$BRIDGE_URL" >/dev/null 2>&1; then
+if ! curl -fsS --max-time 8 "$BRIDGE_URL" >/dev/null 2>&1; then
   codex-copilot-bridge >>"$BRIDGE_LOG" 2>&1 &
   bridge_pid=$!
   for _ in {1..30}; do
-    if curl -fsS --max-time 1 "$BRIDGE_URL" >/dev/null 2>&1; then
+    if curl -fsS --max-time 8 "$BRIDGE_URL" >/dev/null 2>&1; then
       break
     fi
     sleep 0.2
   done
-  if ! curl -fsS --max-time 1 "$BRIDGE_URL" >/dev/null 2>&1; then
+  if ! curl -fsS --max-time 8 "$BRIDGE_URL" >/dev/null 2>&1; then
     echo "$WRAPPER_NAME: failed to start codex-copilot-bridge; log: $BRIDGE_LOG" >&2
     kill "$bridge_pid" >/dev/null 2>&1 || true
     exit 1
@@ -90,7 +90,7 @@ function supportsMessagesAdapter(model) {
   return !supportsResponses(model) && (endpoints.includes("/v1/messages") || endpoints.includes("/messages"))
 }
 
-const response = await fetch(bridgeURL)
+const response = await fetch(bridgeURL, { signal: AbortSignal.timeout(8000) })
 if (!response.ok) throw new Error(`models failed: ${response.status}`)
 const live = await response.json()
 const allLiveModels = Array.isArray(live?.models) ? live.models : Array.isArray(live?.data) ? live.data : []

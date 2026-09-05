@@ -23,12 +23,33 @@ function streamFromText(text: string) {
 }
 
 describe("responsesToAnthropicMessages", () => {
+  test("applies advertised adaptive reasoning effort to the Messages payload", () => {
+    const result = responsesToAnthropicMessages({ model: "claude", input: "hi", reasoning: { effort: "xhigh" } }, {
+      capabilities: { supports: { adaptive_thinking: true, reasoning_effort: ["high", "xhigh", "max"] } },
+    })
+    expect(result).toMatchObject({ ok: true, value: {
+      thinking: { type: "adaptive" }, output_config: { effort: "xhigh" },
+    } })
+  })
+
+  test("converts budget variants without exceeding max_tokens", () => {
+    const result = responsesToAnthropicMessages({ model: "claude", input: "hi", reasoning: { effort: "max" } }, {
+      capabilities: { limits: { max_output_tokens: 32000 }, supports: { min_thinking_budget: 1024, max_thinking_budget: 32000 } },
+    })
+    expect(result).toMatchObject({ ok: true, value: { max_tokens: 32000, thinking: { type: "enabled", budget_tokens: 31999 } } })
+  })
+
+  test("rejects unsupported effort and impossible thinking budgets", () => {
+    const metadata = { capabilities: { limits: { max_output_tokens: 32000 }, supports: { min_thinking_budget: 1024, max_thinking_budget: 32000 } } }
+    expect(responsesToAnthropicMessages({ model: "claude", reasoning: { effort: "medium" } }, metadata)).toMatchObject({ ok: false, status: 400 })
+    expect(responsesToAnthropicMessages({ model: "claude", max_output_tokens: 500, reasoning: { effort: "max" } }, metadata)).toMatchObject({ ok: false, status: 400 })
+  })
+
   test("maps instructions, text input, max_output_tokens, function tools, and tool_choice", () => {
     const result = responsesToAnthropicMessages({
       model: "claude-sonnet-4",
       instructions: "Be terse.",
       input: "Hello",
-      reasoning: { effort: "high" },
       max_output_tokens: 321,
       tools: [
         { type: "image_generation" },

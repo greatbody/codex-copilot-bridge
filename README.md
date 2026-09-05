@@ -76,14 +76,19 @@ The Claude adapter currently supports non-streaming responses and streaming text
 - Responses `function_call_output` items to Claude `tool_result` blocks
 - Claude `tool_use` blocks back to Responses `function_call` output items
 - `max_output_tokens` to `max_tokens`
-- available usage fields
+- `reasoning.effort` to advertised adaptive thinking (`thinking.type="adaptive"` and `output_config.effort`), or `high`/`max` thinking budgets for budget-based models
+- usage fields, including cache reads and cache creation in the input-token total
+
+The Claude adapter derives selectable reasoning levels from Copilot metadata. Unsupported efforts return HTTP 400 instead of being silently dropped. Thinking budgets stay below `max_tokens` and respect the advertised minimum and output limit. When omitted, `max_tokens` defaults to the advertised output limit (4096 if unavailable). Forced tool choices cannot be combined with thinking; use `auto`.
+
+Original signed thinking and redacted-thinking blocks accompanying tool calls are retained in memory and restored on follow-up requests, for both streaming and non-streaming responses. The cache is scoped by model and tool-call ID, expires after one hour, and holds at most 4096 tool calls. Restarting the bridge clears it. Raw thinking and signatures are not exposed as Responses output.
 
 Known limitations for the Claude adapter:
 
-- OpenAI hosted tools such as image generation, web search, file search, computer use, and code interpreter are rejected with JSON errors.
+- `image_generation` tools are filtered out; hosted web search, file search, computer use, and code interpreter are rejected with JSON errors.
 - `previous_response_id` persistence is not implemented; send the full conversation context instead.
 - Exact OpenAI Responses streaming event parity is not guaranteed.
-- Encrypted reasoning content and provider-native reasoning controls are dropped because they are not representable in Anthropic Messages.
+- OpenAI encrypted reasoning cannot be translated into Claude thinking; only the bridge's original cached Claude blocks are replayed.
 - Provider-specific fields without an Anthropic Messages equivalent may be ignored.
 
 ## Codex Config Example
@@ -104,6 +109,10 @@ Both wrappers keep the same argument shape as `codex`; they prepend the Copilot 
 The wrappers also select separate Codex config profiles by default: `ghcodex` uses `~/.codex/copilot.config.toml`, and `claudex` uses `~/.codex/claudex.config.toml`. This keeps `/model` selections isolated from the global `~/.codex/config.toml` and from each other. Pass your own `--profile <name>` if you want to override this behavior.
 
 The bridge builds its Codex model list from Copilot's live `/models` response. If `~/.codex/models_cache.json` contains a template for a live model, the bridge reuses that template and overwrites availability, endpoint, context-window, and token-limit fields from Copilot. Live Copilot models that are not in Codex's cache are exposed dynamically when the bridge can serve them through native `/responses` passthrough or the local Messages adapter.
+
+Model discovery has a five-second timeout, coalesces concurrent requests, and caches results for 30 seconds. Transient refresh failures keep the last successful list and retry after five seconds; the first discovery must succeed. `CODEX_HOME` is respected when reading the model cache.
+
+Total context, maximum input, and maximum output remain separate. Missing total context falls back to the upstream input limit, never an unrelated cached model's window. The bridge sets `auto_compact_token_limit` to the input limit minus up to 20,000 output/headroom tokens; without an input limit it reserves the output limit from total context. Codex may compact earlier according to its own context percentage. Missing capabilities are explicitly cleared when templates are merged, and models without advertised vision support are text-only.
 
 Manual GPT/native equivalent:
 

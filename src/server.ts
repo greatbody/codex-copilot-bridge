@@ -2,12 +2,13 @@ import path from "node:path"
 import { anthropicStreamToResponsesStream, anthropicToResponses, responsesToAnthropicMessages } from "./anthropic-adapter"
 import { buildCodexModels, loadCopilotModels, selectCopilotEndpoint, type CodexModelTemplate, type CopilotModel } from "./copilot"
 import { rewriteCopilotFastResponsesRequest, sanitizeResponsesBody } from "./responses-sanitize"
+import { AnthropicReasoningCache } from "./reasoning-cache"
 
 const port = Number(process.env.PORT || 18787)
 const baseURL = "https://api.githubcopilot.com"
 const apiVersion = "2026-06-01"
 const authFile = process.env.OPENCODE_AUTH_FILE ?? path.join(process.env.HOME ?? "", ".local/share/opencode/auth.json")
-const codexModelsCacheFile = path.join(process.env.HOME ?? "", ".codex/models_cache.json")
+const codexModelsCacheFile = path.join(process.env.CODEX_HOME ?? path.join(process.env.HOME ?? "", ".codex"), "models_cache.json")
 
 type AuthFile = Record<string, { type?: string; refresh?: string; enterpriseUrl?: string } | undefined>
 type CodexModelCache = {
@@ -54,32 +55,34 @@ async function codexModelTemplates(available: CopilotModel[]) {
   return buildCodexModels(available, cache?.models ?? [])
 }
 
-async function fetchCopilotModels() {
-  const response = await copilotFetch(`${resolvedBaseURL}/models`)
+async function fetchCopilotModels(baseURL: string, fetchUpstream: typeof copilotFetch) {
+  const response = await fetchUpstream(`${baseURL}/models`, { signal: AbortSignal.timeout(5000) })
   if (!response.ok) {
     throw new Error(`Copilot models failed: ${response.status}`)
   }
   const body = (await response.json()) as { data?: CopilotModel[] }
-  return body.data ?? []
+  if (!Array.isArray(body.data)) throw new Error("Copilot models returned an invalid model list.")
+  return body.data
 }
 
-const initialAuth = await readCopilotAuth()
-const resolvedBaseURL = resolveBaseURL(initialAuth.enterpriseUrl)
-
-Bun.serve({
-  port,
-  hostname: "127.0.0.1",
-  async fetch(request) {
+export function createHandler(
+  resolvedBaseURL: string,
+  fetchUpstream: typeof copilotFetch = copilotFetch,
+  getModels = () => loadCopilotModels(() => fetchCopilotModels(resolvedBaseURL, fetchUpstream)),
+  getTemplates = codexModelTemplates,
+) {
+  const reasoningCache = new AnthropicReasoningCache()
+  return async (request: Request) => {
     const url = new URL(request.url)
 
     if (request.method === "GET" && url.pathname === "/v1/models") {
       let available: CopilotModel[]
       try {
-        available = await loadCopilotModels(fetchCopilotModels)
+        available = await getModels()
       } catch (error) {
         return json({ error: { message: error instanceof Error ? error.message : "Copilot models failed" } }, 502)
       }
-      const models = await codexModelTemplates(available)
+      const models = await getTemplates(available)
       return json({ object: "list", data: models, models })
     }
 
@@ -91,11 +94,14 @@ Bun.serve({
       } catch {
         return json({ error: { message: "Request body must be valid JSON." } }, 400)
       }
+      if (!body || typeof body !== "object" || Array.isArray(body)) {
+        return json({ error: { message: "Request body must be a JSON object." } }, 400)
+      }
       body = rewriteCopilotFastResponsesRequest(body)
 
       let models: CopilotModel[]
       try {
-        models = await loadCopilotModels(fetchCopilotModels)
+        models = await getModels()
       } catch (error) {
         return json({ error: { message: error instanceof Error ? error.message : "Copilot models failed" } }, 502)
       }
@@ -106,14 +112,18 @@ Bun.serve({
       }
 
       if (selection.kind === "messages") {
-        const converted = responsesToAnthropicMessages(body)
+        const converted = responsesToAnthropicMessages(body, selection.model)
         if (!converted.ok) return json({ error: { message: converted.message } }, converted.status)
+        reasoningCache.apply(converted.value)
+        const observe = (content: unknown) => reasoningCache.store(content, converted.value.model)
 
-        const response = await copilotFetch(`${resolvedBaseURL}/v1/messages`, {
+        const response = await fetchUpstream(`${resolvedBaseURL}/v1/messages`, {
           method: "POST",
           headers: {
             "content-type": "application/json",
             accept: converted.value.stream ? "text/event-stream" : "application/json",
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "interleaved-thinking-2025-05-14",
           },
           body: JSON.stringify(converted.value),
         })
@@ -130,15 +140,15 @@ Bun.serve({
         }
 
         if (converted.value.stream) {
-          return new Response(anthropicStreamToResponsesStream(response.body, converted.value.model), {
+          return new Response(anthropicStreamToResponsesStream(response.body, converted.value.model, observe), {
             headers: { "content-type": "text/event-stream" },
           })
         }
 
-        return json(anthropicToResponses(await response.json(), converted.value.model))
+        return json(anthropicToResponses(await response.json(), converted.value.model, observe))
       }
 
-      const response = await copilotFetch(`${resolvedBaseURL}/responses`, {
+      const response = await fetchUpstream(`${resolvedBaseURL}/responses`, {
         method: "POST",
         headers: {
           "content-type": request.headers.get("content-type") || "application/json",
@@ -157,8 +167,12 @@ Bun.serve({
     }
 
     return json({ error: { message: "not found" } }, 404)
-  },
-})
+  }
+}
 
-console.error(`codex-copilot-bridge listening on http://127.0.0.1:${port}/v1`)
-console.error(`using Copilot auth from ${authFile}`)
+if (import.meta.main) {
+  const auth = await readCopilotAuth()
+  Bun.serve({ port, hostname: "127.0.0.1", fetch: createHandler(resolveBaseURL(auth.enterpriseUrl)) })
+  console.error(`codex-copilot-bridge listening on http://127.0.0.1:${port}/v1`)
+  console.error(`using Copilot auth from ${authFile}`)
+}

@@ -12,6 +12,10 @@ export type CopilotModel = {
     supports?: {
       tool_calls?: boolean
       reasoning_effort?: string[]
+      adaptive_thinking?: boolean
+      min_thinking_budget?: number
+      max_thinking_budget?: number
+      vision?: boolean
     }
   }
   policy?: {
@@ -43,6 +47,7 @@ const reasoningDescriptions: Record<string, string> = {
 
 const modelsCacheTtlMs = 30_000
 let modelsCache: ModelsCache | undefined
+let modelsPending: Promise<CopilotModel[]> | undefined
 
 function normalizeEndpoint(endpoint: string) {
   const value = endpoint.trim().toLowerCase()
@@ -60,13 +65,26 @@ export function endpointIsSupported(model: CopilotModel | undefined, endpoint: "
 
 export async function loadCopilotModels(fetchModels: () => Promise<CopilotModel[]>, now = Date.now()) {
   if (modelsCache && modelsCache.expiresAt > now) return modelsCache.models
-  const models = await fetchModels()
-  modelsCache = { models, expiresAt: now + modelsCacheTtlMs }
-  return models
+  if (modelsPending) return modelsPending
+  modelsPending = (async () => {
+    try {
+      const models = await fetchModels()
+      modelsCache = { models, expiresAt: now + modelsCacheTtlMs }
+      return models
+    } catch (error) {
+      if (!modelsCache) throw error
+      modelsCache.expiresAt = now + 5000
+      return modelsCache.models
+    } finally {
+      modelsPending = undefined
+    }
+  })()
+  return modelsPending
 }
 
 export function clearCopilotModelsCache() {
   modelsCache = undefined
+  modelsPending = undefined
 }
 
 function codexModelShape(item: CopilotModel) {
@@ -74,10 +92,17 @@ function codexModelShape(item: CopilotModel) {
   if (item.policy?.state === "disabled") return undefined
   if (!endpointIsSupported(item, "/responses") && !endpointIsSupported(item, "/v1/messages")) return undefined
 
-  const supportedReasoningLevels = (item.capabilities?.supports?.reasoning_effort ?? []).map((effort) => ({
+  const supportedReasoningLevels = reasoningEfforts(item).map((effort) => ({
     effort,
     description: reasoningDescriptions[effort] ?? effort,
   }))
+  const limits = item.capabilities?.limits
+  const context = positiveInteger(limits?.max_context_window_tokens) ?? positiveInteger(limits?.max_prompt_tokens)
+  const input = positiveInteger(limits?.max_prompt_tokens)
+  const output = positiveInteger(limits?.max_output_tokens)
+  const usable = input !== undefined
+    ? Math.max(1, Math.min(input, context ?? input) - Math.min(20000, output ?? 20000))
+    : context !== undefined ? Math.max(1, context - (output ?? 20000)) : null
 
   return {
     slug: item.id,
@@ -85,7 +110,7 @@ function codexModelShape(item: CopilotModel) {
     description: item.name ?? item.id,
     default_reasoning_level: supportedReasoningLevels.some((item) => item.effort === "medium")
       ? "medium"
-      : supportedReasoningLevels[0]?.effort,
+      : supportedReasoningLevels[0]?.effort ?? null,
     supported_reasoning_levels: supportedReasoningLevels,
     object: "model",
     id: item.id,
@@ -94,11 +119,15 @@ function codexModelShape(item: CopilotModel) {
     visibility: item.model_picker_enabled ? "list" : "hidden",
     supported_in_api: true,
     priority: item.model_picker_enabled ? 50 : 100,
-    context_window: item.capabilities?.limits?.max_context_window_tokens,
-    max_context_window: item.capabilities?.limits?.max_context_window_tokens,
-    max_context_window_tokens: item.capabilities?.limits?.max_context_window_tokens,
-    max_output_tokens: item.capabilities?.limits?.max_output_tokens,
-    max_prompt_tokens: item.capabilities?.limits?.max_prompt_tokens,
+    context_window: context ?? null,
+    max_context_window: context ?? null,
+    max_context_window_tokens: context ?? null,
+    max_output_tokens: output ?? null,
+    max_prompt_tokens: input ?? null,
+    auto_compact_token_limit: usable,
+    effective_context_window_percent: 95,
+    input_modalities: item.capabilities?.supports?.vision ? ["text", "image"] : ["text"],
+    supports_reasoning_summaries: endpointIsSupported(item, "/responses") && supportedReasoningLevels.length > 0,
   }
 }
 
@@ -113,12 +142,6 @@ export function buildCodexModels(available: CopilotModel[], templates: CodexMode
       ...(fallbackTemplate ?? {}),
       ...(template ?? {}),
       ...override,
-      default_reasoning_level: override.default_reasoning_level ?? template?.default_reasoning_level,
-      context_window: override.context_window ?? template?.context_window ?? fallbackTemplate?.context_window,
-      max_context_window: override.max_context_window ?? template?.max_context_window ?? fallbackTemplate?.max_context_window,
-      max_context_window_tokens: override.max_context_window_tokens ?? template?.max_context_window_tokens ?? fallbackTemplate?.max_context_window_tokens,
-      max_prompt_tokens: override.max_prompt_tokens ?? template?.max_prompt_tokens ?? fallbackTemplate?.max_prompt_tokens,
-      max_output_tokens: override.max_output_tokens ?? template?.max_output_tokens ?? fallbackTemplate?.max_output_tokens,
     }
   }
 
@@ -152,6 +175,9 @@ export function selectCopilotEndpoint(models: CopilotModel[], modelID: unknown):
   if (!model) {
     return { kind: "unsupported", message: `Copilot model '${modelID}' was not found in /models metadata.` }
   }
+  if (model.policy?.state === "disabled") {
+    return { kind: "unsupported", model, message: `Copilot model '${modelID}' is disabled by policy.` }
+  }
 
   if (endpointIsSupported(model, "/responses")) return { kind: "responses", model }
   if (endpointIsSupported(model, "/v1/messages")) return { kind: "messages", model }
@@ -162,4 +188,18 @@ export function selectCopilotEndpoint(models: CopilotModel[], modelID: unknown):
     model,
     message: `Copilot model '${modelID}' does not support /responses or /v1/messages. Supported endpoints: ${endpoints}.`,
   }
+}
+
+export function positiveInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined
+}
+
+export function reasoningEfforts(model: CopilotModel, messages = !endpointIsSupported(model, "/responses")): string[] {
+  const supports = model.capabilities?.supports
+  const efforts = [...new Set((supports?.reasoning_effort ?? []).filter(effort => typeof effort === "string" && effort.length > 0))]
+  if (!messages || supports?.adaptive_thinking) return efforts
+  const maximum = positiveInteger(supports?.max_thinking_budget)
+  const minimum = positiveInteger(supports?.min_thinking_budget) ?? 1024
+  const output = positiveInteger(model.capabilities?.limits?.max_output_tokens)
+  return maximum && Math.min(maximum, output ?? maximum) > minimum ? ["high", "max"] : []
 }
