@@ -1,6 +1,6 @@
 {
   "name": "codex-copilot-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Local bridge for using GitHub Copilot models from Codex CLI through an existing OpenCode Copilot login.",
   "license": "MIT",
