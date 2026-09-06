@@ -4,6 +4,7 @@ import { buildCodexModels, loadCopilotModels, selectCopilotEndpoint, type CodexM
 import { rewriteCopilotFastResponsesRequest, sanitizeResponsesBody } from "./responses-sanitize"
 import { AnthropicReasoningCache } from "./reasoning-cache"
 import { version } from "../package.json"
+import { normalizeCopilotResponsesStream } from "./responses-stream"
 
 const baseURL = "https://api.githubcopilot.com"
 const apiVersion = "2026-06-01"
@@ -161,11 +162,16 @@ export function createHandler(
           accept: request.headers.get("accept") || "text/event-stream",
         },
         body: sanitizeResponsesBody(JSON.stringify(body)),
+        signal: request.signal,
       })
       const headers = new Headers(response.headers)
       headers.delete("content-encoding")
       headers.delete("content-length")
-      return new Response(response.body, {
+      const sse = response.ok && response.body && headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase() === "text/event-stream"
+      if (sse) {
+        for (const header of ["etag", "content-md5", "digest", "content-digest", "repr-digest", "accept-ranges", "content-range"]) headers.delete(header)
+      }
+      return new Response(sse ? normalizeCopilotResponsesStream(response.body!) : response.body, {
         status: response.status,
         statusText: response.statusText,
         headers,
