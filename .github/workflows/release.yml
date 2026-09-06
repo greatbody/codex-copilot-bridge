@@ -1,77 +1,244 @@
 name: Release
 
+# Publish only the commit selected by an existing pushed tag, never a dispatch branch.
 on:
   push:
-    tags:
-      - "v*"
-  workflow_dispatch:
+    tags: ['v*']
 
-permissions:
-  contents: write
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  release:
-    runs-on: macos-13
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          bun-version: latest
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      - name: Match stable tag to package version on the release commit
+        id: version
+        run: |
+          bun -e '
+            const version = (await Bun.file("package.json").json()).version;
+            if (typeof version !== "string" || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version)) {
+              throw new Error("Release requires a stable major.minor.patch version");
+            }
+            if (process.env.GITHUB_REF !== `refs/tags/v${version}`) {
+              throw new Error("Tag must exactly match package.json version");
+            }
+            console.log(`version=${version}`);
+          ' >> "$GITHUB_OUTPUT"
 
+  build:
+    name: Build (${{ matrix.platform }})
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            runner: macos-15
+          - platform: darwin-x64
+            runner: macos-15-intel
+          - platform: linux-x64
+            runner: ubuntu-24.04
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+    env:
+      PLATFORM: ${{ matrix.platform }}
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.20.0'
+          package-manager-cache: false
+      - name: Verify native host
+        run: |
+          bun -e 'if (`${process.platform}-${process.arch}` !== process.env.PLATFORM) throw new Error("Runner does not match target platform")'
       - name: Install dependencies
         run: bun install --frozen-lockfile
-
-      - name: Verify tag version
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Typecheck
+        run: bun run check
+      - name: Test
+        run: bun run test
+      - name: Build once on native host
+        run: bun run package:release "$PLATFORM"
+      - name: Smoke test archive and local npm install without credentials
+        run: bun run smoke "$PLATFORM"
+      - name: Verify expected outputs
         run: |
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          PACKAGE_VERSION="$(bun -e 'console.log((await Bun.file("package.json").json()).version)')"
-          test "$TAG_VERSION" = "$PACKAGE_VERSION"
+          test -x "dist/$PLATFORM/codex-copilot-bridge"
+          test -s "dist/codex-copilot-bridge-v$VERSION-$PLATFORM.tar.gz"
+      - name: Attest native binary and archive
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/${{ matrix.platform }}/codex-copilot-bridge
+            dist/codex-copilot-bridge-v${{ needs.validate.outputs.version }}-${{ matrix.platform }}.tar.gz
+      - name: Upload native binary and archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.platform }}
+          path: |
+            dist/${{ matrix.platform }}/codex-copilot-bridge
+            dist/codex-copilot-bridge-v${{ needs.validate.outputs.version }}-${{ matrix.platform }}.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
 
-      - name: Build release archive
-        run: bun run package:release
-
-      - name: Compute archive metadata
-        id: archive
+  release:
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Compute checksums of all four tested archives
+        working-directory: dist
         run: |
-          VERSION="$(bun -e 'console.log((await Bun.file("package.json").json()).version)')"
-          ASSET="codex-copilot-bridge-v${VERSION}-darwin-x64.tar.gz"
-          SHA256="$(shasum -a 256 "dist/${ASSET}" | cut -d ' ' -f 1)"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "asset=${ASSET}" >> "$GITHUB_OUTPUT"
-          echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
-
-      - name: Create GitHub release
+          for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+            sha256sum "codex-copilot-bridge-v$VERSION-$platform.tar.gz"
+          done > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      # Fail closed if the release already exists. Never clobber published assets.
+      - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "v${{ steps.archive.outputs.version }}" "dist/${{ steps.archive.outputs.asset }}" \
-            --title "v${{ steps.archive.outputs.version }}" \
-            --notes "macOS x64 release. Tested on macOS with Codex CLI v0.137.0." \
-            --verify-tag
+          gh release create "v$VERSION" \
+            "dist/codex-copilot-bridge-v$VERSION-darwin-arm64.tar.gz" \
+            "dist/codex-copilot-bridge-v$VERSION-darwin-x64.tar.gz" \
+            "dist/codex-copilot-bridge-v$VERSION-linux-x64.tar.gz" \
+            "dist/codex-copilot-bridge-v$VERSION-linux-arm64.tar.gz" \
+            dist/SHA256SUMS \
+            --title "v$VERSION" --generate-notes --verify-tag
 
+  npm:
+    # Configure trusted publishing for all five packages before opting in.
+    # Use greatbody/codex-copilot-bridge, workflow release.yml, and explicitly
+    # allow direct npm publish (new trusted publishers default to staging only).
+    if: vars.PUBLISH_NPM == 'true'
+    needs: [validate, release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.20.0'
+          package-manager-cache: false
+      - name: Pin npm with trusted publishing support
+        run: npm install --global npm@12.0.2 --ignore-scripts
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Package npm distribution from tested binaries without recompiling
+        run: |
+          # Artifact downloads do not preserve executable file permissions.
+          for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+            chmod +x "dist/$platform/codex-copilot-bridge"
+          done
+          bun run package:npm
+      # npm versions are immutable. An existing version fails the job; do not
+      # blindly skip conflicts on retry, since content equivalence is unverified.
+      - name: Publish platform packages before the public launcher via OIDC
+        run: |
+          for package in darwin-arm64 darwin-x64 linux-x64 linux-arm64 codex-copilot-bridge; do
+            npm publish "./dist/npm/$package" --access public --provenance \
+              --ignore-scripts --registry https://registry.npmjs.org/
+          done
+
+  homebrew:
+    # The tap token needs Contents: write on greatbody/homebrew-tap only.
+    if: vars.UPDATE_HOMEBREW == 'true'
+    needs: [validate, release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      - name: Download published checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "v$VERSION" --pattern SHA256SUMS --dir dist
       - name: Checkout Homebrew tap
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: greatbody/homebrew-tap
           token: ${{ secrets.GH_TOKEN_FOR_TAP }}
           path: homebrew-tap
-
-      - name: Update Homebrew formula
+          persist-credentials: true
+      - name: Update formula from published archive checksums
         run: |
           bun run scripts/update-homebrew-formula.ts \
-            homebrew-tap/Formula/codex-copilot-bridge.rb \
-            "${{ steps.archive.outputs.version }}" \
-            "${{ steps.archive.outputs.sha256 }}"
-
-      - name: Commit Homebrew formula
+            homebrew-tap/Formula/codex-copilot-bridge.rb "$VERSION" dist/SHA256SUMS
+      - name: Commit and push changed formula only
         working-directory: homebrew-tap
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Formula/codex-copilot-bridge.rb
-          git commit -m "codex-copilot-bridge ${{ steps.archive.outputs.version }}"
+          if git diff --cached --quiet; then
+            echo "Formula is already up to date."
+            exit 0
+          fi
+          git -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -m "codex-copilot-bridge $VERSION"
           git push
