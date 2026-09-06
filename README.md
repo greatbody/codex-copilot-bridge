@@ -137,11 +137,27 @@ PORT=18788 codex-copilot-bridge serve
 
 Codex should be configured with `wire_api="responses"`. For each `POST /v1/responses` request, the bridge checks live GitHub Copilot `/models` metadata and chooses the upstream endpoint for the requested model:
 
-- Models that advertise native `/responses` support are passed through to Copilot's `/responses` endpoint. The existing request sanitization still removes `image_generation` tools before passthrough.
+- Models that advertise native `/responses` support are forwarded to Copilot's `/responses` endpoint. Successful SSE responses have their protocol identities normalized as described below. The existing request sanitization still removes `image_generation` tools before forwarding.
 - Models that do not advertise `/responses` but do advertise `/v1/messages` are handled by the local Claude Messages adapter. This is Responses compatibility via translation, not native Claude Responses support.
 - Models that advertise neither endpoint return a JSON error explaining the supported endpoints reported by Copilot.
 
 For `gpt-5.6-sol`, Codex `service_tier="fast"`, `"priority"`, and `"ultrafast"` requests are routed to Copilot's `gpt-5.6-sol-fast` model ID with the unsupported `service_tier` field removed. Copilot serves this route as Fast/Priority processing; the bridge does not claim native Ultrafast service from Copilot.
+
+### Native SSE Identities
+
+Copilot can return different opaque IDs for the same response or output item across start, delta, done, and final-snapshot events. Clients that upsert messages by ID can then display one message twice. `src/responses-stream.ts` retains the first response ID and the first item ID for each `output_index`, including reasoning and tools in final output-array positions. It never deduplicates text: separate messages containing identical text remain separate.
+
+This follows [OpenCode's Copilot compatibility approach](https://github.com/anomalyco/opencode/blob/bbd72fb8b0bb6de580d2041a0150016227c63ac0/packages/core/src/github-copilot/responses/openai-responses-language-model.ts), but keeps Responses SSE rather than emitting AI SDK events. Completion events and their full output payloads remain present. Only known protocol `response.id`, `response_id`, `item.id`, and `item_id` slots change; `call_id`, arguments, encrypted reasoning, annotations, phase, usage, and arbitrary metadata are not recursively rewritten.
+
+Missing start events are supported when an output index is available. Without an index, a previously observed ID can identify the item; a new rotating ID is accepted only when its type has exactly one observed, still-open item. Missing-index starts, conflicting references, and ambiguous events fail the stream rather than guessing or merging items. No replacement IDs are generated, and all identity state is scoped to one request.
+
+The parser incrementally handles UTF-8, LF/CRLF/CR framing and multiline data, retaining SSE fields, comments, unknown events, and `[DONE]`. Malformed/non-JSON data frames pass through unchanged. Invalid UTF-8, ambiguous identities, or resource limits produce a stream error and cancel the upstream reader. Limits are 16 Mi UTF-16 code units per frame, 4096 output items, and 65536 observed item-ID aliases per stream. Unknown future event types are deliberately not normalized. Non-streaming JSON, HTTP error bodies and the Anthropic adapter are unchanged. Transformed bodies do not retain stale length, encoding, entity-tag, digest or range headers.
+
+Regression coverage in `test/responses-stream*.test.ts` includes an actual HTTP bridge, identical-text messages, reasoning/tool snapshots, tool-result continuation, interleaved requests, framing, backpressure, cancellation and errors. Before the fix, the ID-keyed consumer fixture produced four entries for two messages on both GPT-6 and GPT-5.5 fixtures; after normalization it produces exactly two, without changing their content. These fixtures are synthetic, not packet captures.
+
+Direct stream cancellation/error tests verify upstream cancellation and reader release. HTTP disconnect tests use an explicit client request abort: Bun's HTTP fetch reader cancellation alone did not reliably close the connection during testing. This patch forwards the incoming request's abort signal upstream; it does not claim to change that client-runtime behavior.
+
+Local live verification on 2026-09-06 used an ephemeral patched bridge and GPT-6 Astra: a small text stream and a forced synthetic function call followed by its result all returned HTTP 200 with stable response/item identities and the expected text. The follow-up reused the normalized final output objects and original first-seen opaque IDs without alteration, preserving `call_id`. This validates that stateless tool round trip, not arbitrary opaque-ID reuse, encrypted-reasoning continuation (no reasoning item was returned), or `previous_response_id` persistence. The desktop UI and deployed service have not been verified or changed by this repository fix.
 
 The Claude adapter currently supports non-streaming responses and streaming text/tool-call events. It maps common Codex Responses fields into Anthropic Messages:
 
