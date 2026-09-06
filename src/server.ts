@@ -3,8 +3,8 @@ import { anthropicStreamToResponsesStream, anthropicToResponses, responsesToAnth
 import { buildCodexModels, loadCopilotModels, selectCopilotEndpoint, type CodexModelTemplate, type CopilotModel } from "./copilot"
 import { rewriteCopilotFastResponsesRequest, sanitizeResponsesBody } from "./responses-sanitize"
 import { AnthropicReasoningCache } from "./reasoning-cache"
+import { version } from "../package.json"
 
-const port = Number(process.env.PORT || 18787)
 const baseURL = "https://api.githubcopilot.com"
 const apiVersion = "2026-06-01"
 const authFile = process.env.OPENCODE_AUTH_FILE ?? path.join(process.env.HOME ?? "", ".local/share/opencode/auth.json")
@@ -23,10 +23,12 @@ function resolveBaseURL(enterpriseUrl?: string) {
   return enterpriseUrl ? `https://copilot-api.${normalizeDomain(enterpriseUrl)}` : baseURL
 }
 
-async function readCopilotAuth() {
-  const parsed = (await Bun.file(authFile).json()) as AuthFile
-  const auth = parsed["github-copilot"]
-  if (auth?.type !== "oauth" || !auth.refresh) {
+export async function readCopilotAuth() {
+  const parsed = (await Bun.file(authFile).json().catch(() => {
+    throw new Error(`Cannot read Copilot credentials at ${authFile}. Log in using OpenCode first.`)
+  })) as AuthFile
+  const auth = parsed?.["github-copilot"]
+  if (auth?.type !== "oauth" || typeof auth.refresh !== "string" || !auth.refresh) {
     throw new Error(`GitHub Copilot OAuth credential not found in ${authFile}`)
   }
   return auth
@@ -36,7 +38,7 @@ async function copilotFetch(input: RequestInfo | URL, init: RequestInit = {}) {
   const auth = await readCopilotAuth()
   const headers = new Headers(init.headers)
   headers.set("authorization", `Bearer ${auth.refresh}`)
-  headers.set("user-agent", "codex-copilot-bridge/0.1")
+  headers.set("user-agent", `codex-copilot-bridge/${version}`)
   headers.set("openai-intent", "conversation-edits")
   headers.set("x-github-api-version", apiVersion)
   headers.delete("x-api-key")
@@ -74,6 +76,10 @@ export function createHandler(
   const reasoningCache = new AnthropicReasoningCache()
   return async (request: Request) => {
     const url = new URL(request.url)
+
+    if (request.method === "GET" && url.pathname === "/health") {
+      return json({ service: "codex-copilot-bridge", version, status: "ok" })
+    }
 
     if (request.method === "GET" && url.pathname === "/v1/models") {
       let available: CopilotModel[]
@@ -170,9 +176,13 @@ export function createHandler(
   }
 }
 
-if (import.meta.main) {
+export async function startServer(port = Number(process.env.PORT || 18787)) {
+  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("PORT must be an integer between 0 and 65535")
   const auth = await readCopilotAuth()
-  Bun.serve({ port, hostname: "127.0.0.1", fetch: createHandler(resolveBaseURL(auth.enterpriseUrl)) })
-  console.error(`codex-copilot-bridge listening on http://127.0.0.1:${port}/v1`)
-  console.error(`using Copilot auth from ${authFile}`)
+  return Bun.serve({ port, hostname: "127.0.0.1", fetch: createHandler(resolveBaseURL(auth.enterpriseUrl)) })
+}
+
+if (import.meta.main) {
+  const server = await startServer()
+  console.error(`codex-copilot-bridge listening on ${server.url.origin}/v1`)
 }

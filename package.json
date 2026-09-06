@@ -19,15 +19,11 @@
   },
   "homepage": "https://github.com/greatbody/codex-copilot-bridge#readme",
   "type": "module",
-  "bin": {
-    "ghcodex": "./bin/ghcodex",
-    "claudex": "./bin/ghcodex"
-  },
   "scripts": {
-    "start": "bun run src/server.ts",
+    "start": "bun run src/cli.ts",
     "check": "tsc --noEmit",
     "test": "bun test",
-    "build": "bun build src/server.ts --compile --outfile dist/codex-copilot-bridge",
+    "build": "bun build src/cli.ts --compile --outfile dist/codex-copilot-bridge",
     "package:release": "bun run check && bun run scripts/package-release.ts",
     "formula:update": "bun run scripts/update-homebrew-formula.ts",
     "install:bin": "bun run check && bun run build && bun run scripts/install.ts"
