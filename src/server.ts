@@ -43,7 +43,10 @@ async function copilotFetch(input: RequestInfo | URL, init: RequestInit = {}) {
   headers.set("openai-intent", "conversation-edits")
   headers.set("x-github-api-version", apiVersion)
   headers.delete("x-api-key")
-  return fetch(input, { ...init, headers })
+  // Match OpenCode: reasoning can be silent longer than Bun's fetch timeout.
+  // Explicit AbortSignals still bound model discovery and client cancellation.
+  const options = { ...init, headers, timeout: false } // Bun runtime option, absent from its fetch types.
+  return fetch(input, options)
 }
 
 function json(data: unknown, status = 200, headers?: HeadersInit) {
@@ -133,6 +136,7 @@ export function createHandler(
             "anthropic-beta": "interleaved-thinking-2025-05-14",
           },
           body: JSON.stringify(converted.value),
+          signal: request.signal,
         })
 
         if (!response.ok) {
@@ -185,7 +189,14 @@ export function createHandler(
 export async function startServer(port = Number(process.env.PORT || 18787)) {
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("PORT must be an integer between 0 and 65535")
   const auth = await readCopilotAuth()
-  return Bun.serve({ port, hostname: "127.0.0.1", fetch: createHandler(resolveBaseURL(auth.enterpriseUrl)) })
+  return Bun.serve({
+    port,
+    hostname: "127.0.0.1",
+    // Bun defaults to 10 seconds, including gaps between SSE events. A model
+    // thinking silently must not be mistaken for an abandoned HTTP connection.
+    idleTimeout: 0,
+    fetch: createHandler(resolveBaseURL(auth.enterpriseUrl)),
+  })
 }
 
 if (import.meta.main) {

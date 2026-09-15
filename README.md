@@ -209,6 +209,14 @@ Model discovery has a five-second timeout, coalesces concurrent requests, and ca
 
 Total context, maximum input, and maximum output remain separate. Missing total context falls back to the upstream input limit, never an unrelated cached model's window. The bridge sets `auto_compact_token_limit` to the input limit minus up to 20,000 output/headroom tokens; without an input limit it reserves the output limit from total context. Codex may compact earlier according to its own context percentage. Missing capabilities are explicitly cleared when templates are merged, and models without advertised vision support are text-only.
 
+### Long-running Requests and Disconnects
+
+The server explicitly disables Bun's default **10-second HTTP idle timeout** (`idleTimeout: 0`). This timeout applies to silence while waiting for headers or between SSE writes, not the total duration of a Codex task. Reasoning models can legitimately pause longer than this. Without the override, Bun closes a healthy inference stream before `response.completed`; an intermediate gateway may report `unexpected EOF` and replace it with `Upstream request failed`. Retrying the same reasoning request can hit the same timeout repeatedly.
+
+Outbound fetch also disables Bun's built-in timeout, matching OpenCode's provider transport. Explicit AbortSignals still enforce the five-second model-discovery deadline and propagate client cancellation for both native Responses and Claude requests. The bridge does not impose a total inference deadline; clients and any intermediate proxies retain their own timeout policies.
+
+The regression test in `test/server-timeout.test.ts` exercises the production `startServer` entrypoint with delayed headers, a 16-second SSE gap, and cancellation on both adapters. On 2026-09-15, a same-host live comparison using GPT-6 Astra and the same synthetic math prompt saw the deployed pre-fix binary close after 24.3 seconds without a terminal event, while a temporary patched instance completed after 248.7 seconds. This verifies the direct bridge-to-Copilot path; the temporary instance was stopped afterward. See [the investigation report](docs/stream-idle-timeout.md) for evidence and deployment boundaries.
+
 For the manual examples below, first run `codex-copilot-bridge serve` in another terminal. Adjust the base URL if you changed `PORT`.
 
 Manual GPT/native equivalent:
