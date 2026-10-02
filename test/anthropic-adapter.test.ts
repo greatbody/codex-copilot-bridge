@@ -122,11 +122,54 @@ describe("responsesToAnthropicMessages", () => {
     ])
   })
 
-  test("rejects hosted OpenAI tools and previous_response_id while dropping reasoning blocks", () => {
+  test("filters web search declarations without changing the input or function tools", () => {
+    const body = {
+      model: "claude-sonnet-4",
+      input: [
+        { role: "user", content: "Remember reference A17." },
+        { role: "assistant", content: "Reference A17 remembered." },
+        { role: "user", content: "What was the reference?" },
+      ],
+      tools: [
+        { type: "web_search" },
+        { type: "web_search_preview" },
+        { type: "web_search_preview_2025_03_11" },
+        { type: "function", name: "lookup", parameters: { type: "object" } },
+      ],
+    }
+    const original = structuredClone(body)
+    const result = responsesToAnthropicMessages(body)
+    expect(body).toEqual(original)
+    expect(result).toMatchObject({ ok: true, value: {
+      messages: body.input.map(message => ({ role: message.role, content: [{ type: "text", text: message.content }] })),
+      tools: [{ name: "lookup", input_schema: { type: "object" } }],
+    } })
+    if (!result.ok) throw new Error(result.message)
+    expect(result.value.tools).toHaveLength(1)
+    const searchOnly = responsesToAnthropicMessages({ ...body, tools: [{ type: "web_search" }] })
+    expect(searchOnly).toMatchObject({ ok: true })
+    if (!searchOnly.ok) throw new Error(searchOnly.message)
+    expect(searchOnly.value.tools).toBeUndefined()
+  })
+
+  test("rejects forced web search and required tools when filtering leaves no supported tools", () => {
+    for (const toolChoice of [{ type: "web_search" }, { type: "web_search_preview" }, "required"]) {
+      const result = responsesToAnthropicMessages({
+        model: "claude-sonnet-4", input: "hi", tools: [{ type: "web_search" }], tool_choice: toolChoice,
+      })
+      expect(result).toMatchObject({ ok: false, status: 400 })
+    }
+    expect(responsesToAnthropicMessages({
+      model: "claude-sonnet-4", input: "hi", tool_choice: "required",
+      tools: [{ type: "web_search" }, { type: "function", name: "lookup", parameters: { type: "object" } }],
+    })).toMatchObject({ ok: true, value: { tool_choice: { type: "any" } } })
+  })
+
+  test("rejects other hosted OpenAI tools and previous_response_id while dropping reasoning blocks", () => {
     const hostedTool = responsesToAnthropicMessages({
       model: "claude-sonnet-4",
       input: "hi",
-      tools: [{ type: "web_search_preview" }],
+      tools: [{ type: "file_search" }],
     })
     expect(hostedTool.ok).toBe(false)
     if (hostedTool.ok) throw new Error("expected hosted tool rejection")

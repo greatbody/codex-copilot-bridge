@@ -155,7 +155,7 @@ export function createHandler(
 
       if (selection.kind === "messages") {
         const converted = responsesToAnthropicMessages(body, selection.model)
-        if (!converted.ok) return json({ error: { message: converted.message } }, converted.status)
+        if (!converted.ok) return json({ error: { type: "invalid_request_error", code: "claude_adapter_error", message: converted.message } }, converted.status)
         reasoningCache.apply(converted.value)
         const observe = (content: unknown) => reasoningCache.store(content, converted.value.model)
 

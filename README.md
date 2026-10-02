@@ -191,11 +191,17 @@ Original signed thinking and redacted-thinking blocks accompanying tool calls ar
 
 Known limitations for the Claude adapter:
 
-- `image_generation` tools are filtered out; hosted web search, file search, computer use, and code interpreter are rejected with JSON errors.
+- `image_generation` and `web_search*` tool declarations are filtered out on the Claude Messages route. Function tools remain available, and the native Responses route keeps web search. Explicitly forced web search, or required tool use with no supported tools left, returns HTTP 400.
+- Completed historical `web_search_call` items are retained as labeled external reference data, including every supplied field. Text citation annotations are retained alongside the original text. This preserves the available information rather than recreating native search tool execution; the original input object is not mutated.
+- Unfinished/malformed search history, malformed annotations, and cited assistant history that would be discarded as trailing prefill return HTTP 400 with `error.code="claude_adapter_error"`. See [history compatibility and gateway configuration](docs/claude-web-search-history.md).
+- Responses contain only the current turn's output; clients must append that output to their retained history and send the full conversation on the next request.
+- Hosted file search, computer use, and code interpreter are rejected with JSON errors.
 - `previous_response_id` persistence is not implemented; send the full conversation context instead.
 - Exact OpenAI Responses streaming event parity is not guaranteed.
 - OpenAI encrypted reasoning cannot be translated into Claude thinking; only the bridge's original cached Claude blocks are replayed.
 - Provider-specific fields without an Anthropic Messages equivalent may be ignored.
+
+Live verification on 2026-09-23 covered historical search queries, supplied results and citation URLs in JSON and SSE, three conversation turns, and function-call/result continuation. All 145 tests and the type check passed. Authenticated gateway checks retained all test markers, invalid history and forced search returned HTTP 400, and native GPT Responses remained functional. A real Codex invocation with Claude and `web_search="live"` also completed successfully. This does not recover unavailable source content or provide native web search execution for Claude.
 
 ## Codex Config Example
 
