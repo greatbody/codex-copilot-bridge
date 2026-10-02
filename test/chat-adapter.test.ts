@@ -6,6 +6,9 @@ import { createHandler } from "../src/server"
 const metadata = { id: "gemini-test", model_picker_enabled: true, supported_endpoints: ["/chat/completions"],
   capabilities: { supports: { tool_calls: true, vision: true, reasoning_effort: ["low", "high"] } } }
 const tools = [{ type: "function", name: "lookup", parameters: { type: "object", properties: { city: { type: "string" } } }, strict: true }]
+const namespacedTools = ["crm", "shipping"].map(name => ({
+  type: "namespace", name, description: `${name} tools`, tools,
+}))
 type ResponseBody = ReturnType<typeof chatCompletionsToResponses>
 type StreamEvent = {
   type: string; sequence_number: number; response: ResponseBody; output_index: number;
@@ -93,6 +96,68 @@ describe("Responses to Chat Completions", () => {
     expect(JSON.stringify(result.messages)).toContain("Historical citation annotations")
   })
 
+  test("flattens namespaces without losing descriptions, schemas or same-name tool identities", () => {
+    const body = { input: "hello", tools: [...tools, ...namespacedTools],
+      tool_choice: { type: "function", namespace: "shipping", name: "lookup" } }
+    const original = structuredClone(body)
+    const result = successfulRequest(body)
+    expect(result.tools).toEqual([
+      { type: "function", function: { name: "lookup", parameters: tools[0].parameters, strict: true } },
+      { type: "function", function: { name: "crm__lookup", description: "crm tools", parameters: tools[0].parameters, strict: true } },
+      { type: "function", function: { name: "shipping__lookup", description: "shipping tools", parameters: tools[0].parameters, strict: true } },
+    ])
+    expect(result.tool_choice).toEqual({ type: "function", function: { name: "shipping__lookup" } })
+    expect(body).toEqual(original)
+  })
+
+  test("replays namespaced function history, including tools no longer declared", () => {
+    const input = [
+      { type: "function_call", call_id: "old", namespace: "archived", name: "lookup", arguments: "{}" },
+      { type: "function_call", call_id: "current", namespace: "shipping", name: "lookup", arguments: "{}" },
+      { type: "function_call_output", call_id: "old", output: "old result" },
+      { type: "function_call_output", call_id: "current", output: "current result" },
+    ]
+    expect(successfulRequest({ input, tools: namespacedTools }).messages).toEqual([
+      { role: "assistant", content: null, tool_calls: [
+        { id: "old", type: "function", function: { name: "archived__lookup", arguments: "{}" } },
+        { id: "current", type: "function", function: { name: "shipping__lookup", arguments: "{}" } },
+      ] },
+      { role: "tool", tool_call_id: "old", content: "old result" },
+      { role: "tool", tool_call_id: "current", content: "current result" },
+    ])
+  })
+
+  test("uses bounded collision-safe aliases and strips Responses-only loading metadata", () => {
+    const body = { tools: [
+      { ...tools[0], name: "crm__lookup" },
+      { ...namespacedTools[0], tools: [{ ...tools[0], description: "Find a customer", defer_loading: false }] },
+      { type: "namespace", name: "n".repeat(64), tools: [{ ...tools[0], name: "f".repeat(64) }] },
+      { type: "namespace", name: "a__b", tools: [{ ...tools[0], name: "c" }] },
+      { type: "namespace", name: "a", tools: [{ ...tools[0], name: "b__c" }] },
+    ] }
+    const result = successfulRequest(body)
+    const converted = result.tools as Array<{ function: { name: string; description?: string; defer_loading?: boolean } }>
+    const names = converted.map(tool => tool.function.name)
+    expect(new Set(names).size).toBe(names.length)
+    for (const name of names) expect(name).toMatch(/^[a-zA-Z0-9_-]{1,64}$/)
+    expect(names[0]).toBe("crm__lookup")
+    expect(converted[1].function.description).toBe("crm tools\nFind a customer")
+    expect(converted[1].function).not.toHaveProperty("defer_loading")
+    expect(successfulRequest(body)).toEqual(result)
+    const adapted = responsesToChatCompletions({ input: "hello", ...body }, metadata)
+    if (!adapted.ok) throw new Error(adapted.message)
+    const response = chatCompletionsToResponses({ choices: [{
+      finish_reason: "tool_calls", message: { tool_calls: names.map((name, index) => ({
+        id: `collision_${index}`, type: "function", function: { name, arguments: "{}" },
+      })) },
+    }] }, metadata.id, adapted.toolNames)
+    expect(response.output).toMatchObject([
+      { name: "crm__lookup" }, { namespace: "crm", name: "lookup" },
+      { namespace: "n".repeat(64), name: "f".repeat(64) },
+      { namespace: "a__b", name: "c" }, { namespace: "a", name: "b__c" },
+    ])
+  })
+
   test.each([
     { previous_response_id: "resp_1" }, { conversation: "conv_1" }, { background: true }, { stream: "true" },
     { input: [] }, { input: [{ type: "input_file" }] }, { input: [{ role: "user", content: [{ type: "input_audio" }] }] },
@@ -103,6 +168,15 @@ describe("Responses to Chat Completions", () => {
     { reasoning: { effort: "max" } }, { max_output_tokens: 0 }, { tools: [{ type: "code_interpreter" }] },
     { tool_choice: { type: "web_search" } }, { tool_choice: "required", tools: [{ type: "web_search" }] },
     { tools, tool_choice: { type: "function", name: "undeclared" } },
+    { tools: [{ type: "namespace", name: "", tools }] },
+    { tools: [{ type: "namespace", name: "crm" }] },
+    { tools: [{ type: "namespace", name: "crm", tools: [null] }] },
+    { tools: [{ type: "namespace", name: "crm", tools: [{ type: "custom", name: "patch" }] }] },
+    { tools: [{ type: "namespace", name: "crm", tools: [tools[0], tools[0]] }] },
+    { tools: [tools[0], tools[0]] },
+    { tools: [{ ...tools[0], defer_loading: true }] },
+    { tools: namespacedTools, tool_choice: { type: "function", namespace: "missing", name: "lookup" } },
+    { input: [{ type: "function_call", call_id: "a", namespace: {}, name: "lookup", arguments: "{}" }] },
     { text: { format: { type: "unsupported" } } },
   ])("rejects unsupported or malformed requests: %j", body => {
     expect(responsesToChatCompletions({ model: metadata.id, input: "hello", ...body }, metadata)).toMatchObject({ ok: false, status: 400 })
@@ -110,6 +184,21 @@ describe("Responses to Chat Completions", () => {
 })
 
 describe("Chat completion response mapping", () => {
+  test("restores namespace identities in JSON responses", () => {
+    const converted = responsesToChatCompletions({ input: "hello", tools: namespacedTools }, metadata)
+    if (!converted.ok) throw new Error(converted.message)
+    const response = chatCompletionsToResponses({ choices: [{
+      finish_reason: "tool_calls", message: { tool_calls: [
+        { id: "crm_call", type: "function", function: { name: "crm__lookup", arguments: "{}" } },
+        { id: "ship_call", type: "function", function: { name: "shipping__lookup", arguments: "{}" } },
+      ] },
+    }] }, metadata.id, converted.toolNames)
+    expect(response.output).toMatchObject([
+      { type: "function_call", call_id: "crm_call", namespace: "crm", name: "lookup" },
+      { type: "function_call", call_id: "ship_call", namespace: "shipping", name: "lookup" },
+    ])
+  })
+
   test("maps assistant text, refusal, tool calls, usage and stable function call IDs", () => {
     const response = chatCompletionsToResponses({ model: metadata.id, created: 123, choices: [{
       finish_reason: "tool_calls", message: { content: "checking", refusal: "restricted",
@@ -140,6 +229,29 @@ describe("Chat completion response mapping", () => {
 })
 
 describe("Chat SSE mapping", () => {
+  test("restores namespace identities in every streamed tool item and final output", async () => {
+    const converted = responsesToChatCompletions({ input: "hello", tools: namespacedTools }, metadata)
+    if (!converted.ok) throw new Error(converted.message)
+    const stream = upstreamStream([
+      chunk({ tool_calls: [{ index: 0, function: { name: "shipping__", arguments: '{"city":' } }] }),
+      chunk({ tool_calls: [{ index: 0, id: "call_ns", function: { name: "lookup", arguments: '"Paris"}' } }] }),
+      chunk({ tool_calls: [{ index: 0, function: { name: "shipping__lookup", arguments: "" } }] }),
+      chunk({}, "tool_calls"), "[DONE]",
+    ], "\r\n", true)
+    const text = await new Response(chatStreamToResponsesStream(stream, metadata.id, converted.toolNames)).text()
+    const events = text.split("\n\n").flatMap(frame => {
+      const data = frame.split("\n").find(line => line.startsWith("data: "))?.slice(6)
+      return data && data !== "[DONE]" ? [JSON.parse(data) as StreamEvent] : []
+    })
+    for (const event of events.filter(event => event.item)) {
+      expect(event.item).toMatchObject({ type: "function_call", namespace: "shipping", name: "lookup", call_id: "call_ns" })
+    }
+    expect(events.at(-1)!.response.output).toMatchObject([
+      { namespace: "shipping", name: "lookup", arguments: '{"city":"Paris"}' },
+    ])
+    expect(events.filter(event => event.type === "response.function_call_arguments.delta").map(event => event.delta).join("")).toBe('{"city":"Paris"}')
+  })
+
   test.each(["\n", "\r\n", "\r"])("handles byte-fragmented %j framing, Unicode, parallel tools and usage", async ending => {
     const events = await convertedEvents(upstreamStream([
       chunk({ role: "assistant", content: "\u4f60\u597d" }),
@@ -291,8 +403,10 @@ describe("Chat SSE mapping", () => {
   })
 })
 
-test("HTTP Gemini discovery, streaming and non-streaming tool continuation round trip", async () => {
+test.each([false, true])("HTTP Gemini discovery and tool continuation round trip (namespace=%s)", async namespaced => {
   clearCopilotModelsCache()
+  const declarations = namespaced ? namespacedTools : tools
+  const wireName = namespaced ? "shipping__lookup" : "lookup"
   const received: Record<string, unknown>[] = []
   const upstream = Bun.serve({ port: 0, hostname: "127.0.0.1", async fetch(request) {
     const url = new URL(request.url)
@@ -303,11 +417,13 @@ test("HTTP Gemini discovery, streaming and non-streaming tool continuation round
     if (body.stream) {
       expect(body.stream_options).toEqual({ include_usage: true })
       return new Response(upstreamStream([
-        chunk({ tool_calls: [{ index: 0, id: "call_http", type: "function", function: { name: "lookup", arguments: "{}" } }] }),
+        chunk({ tool_calls: [{ index: 0, id: "call_http", type: "function", function: { name: wireName, arguments: "{}" } }] }),
         chunk({}, "tool_calls"), "[DONE]",
       ]), { headers: { "content-type": "text/event-stream", "etag": "stale", "content-md5": "stale" } })
     }
-    return Response.json({ choices: [{ message: { content: "done" }, finish_reason: "stop" }], usage: { prompt_tokens: 4, completion_tokens: 1 } })
+    return Response.json({ choices: [{ message: { content: "done", tool_calls: [
+      { id: "call_json", type: "function", function: { name: wireName, arguments: "{}" } },
+    ] }, finish_reason: "tool_calls" }], usage: { prompt_tokens: 4, completion_tokens: 1 } })
   } })
   const bridge = Bun.serve({ port: 0, hostname: "127.0.0.1",
     fetch: createHandler(upstream.url.origin, fetch, undefined, async available => buildCodexModels(available)) })
@@ -315,19 +431,22 @@ test("HTTP Gemini discovery, streaming and non-streaming tool continuation round
     const models = await fetch(new URL("/v1/models", bridge.url)).then(response => response.json())
     expect(models.data[0]).toMatchObject({ id: metadata.id, supported_reasoning_levels: [{ effort: "low" }, { effort: "high" }] })
     const send = (body: unknown) => fetch(new URL("/v1/responses", bridge.url), { method: "POST", body: JSON.stringify(body) })
-    const first = await send({ model: metadata.id, input: "lookup", tools, stream: true })
+    const first = await send({ model: metadata.id, input: "lookup", tools: declarations, stream: true })
     expect(first.status).toBe(200)
     expect(first.headers.get("etag")).toBeNull()
     expect(first.headers.get("content-md5")).toBeNull()
     const raw = await first.text()
     const final = JSON.parse(raw.split("\n").find(line => line.startsWith("data: ") && line.includes('"type":"response.completed"'))!.slice(6)).response as ResponseBody
-    const response = await send({ model: metadata.id, tools, input: [
+    expect(final.output[0]).toMatchObject({ name: "lookup", ...(namespaced ? { namespace: "shipping" } : {}) })
+    const response = await send({ model: metadata.id, tools: declarations, input: [
       ...final.output, { type: "function_call_output", call_id: "call_http", output: "contents" },
     ] })
     expect(response.status).toBe(200)
-    expect((await response.json()).output[0].content[0].text).toBe("done")
+    const continued = await response.json()
+    expect(continued.output[0].content[0].text).toBe("done")
+    expect(continued.output[1]).toMatchObject({ name: "lookup", ...(namespaced ? { namespace: "shipping" } : {}) })
     expect(received[1].messages).toEqual([
-      { role: "assistant", content: null, tool_calls: [{ id: "call_http", type: "function", function: { name: "lookup", arguments: "{}" } }] },
+      { role: "assistant", content: null, tool_calls: [{ id: "call_http", type: "function", function: { name: wireName, arguments: "{}" } }] },
       { role: "tool", tool_call_id: "call_http", content: "contents" },
     ])
     const rejected = await send({ model: metadata.id, input: "hello", previous_response_id: "resp_old" })
@@ -361,4 +480,25 @@ test("HTTP adapter passes upstream HTTP errors through and rejects malformed suc
     expect(response.status).toBe(502)
     expect((await response.json()).error.code).toBe("chat_adapter_error")
   }
+})
+
+test("HTTP namespace mappings stay isolated between concurrent requests with identical Chat aliases", async () => {
+  const handler = createHandler("https://copilot.example.test", async (_url, init) => {
+    const body = JSON.parse(String(init?.body))
+    expect(body).not.toHaveProperty("toolNames")
+    await Bun.sleep(1)
+    return Response.json({ choices: [{ finish_reason: "tool_calls", message: { tool_calls: [{
+      id: "call_isolated", type: "function", function: { name: body.tools[0].function.name, arguments: "{}" },
+    }] } }] })
+  }, async () => [metadata])
+  const identities = [{ namespace: "a__b", name: "c" }, { namespace: "a", name: "b__c" }]
+  const responses = await Promise.all(identities.map(async identity => {
+    const response = await handler(new Request("http://localhost/v1/responses", {
+      method: "POST", body: JSON.stringify({ model: metadata.id, input: "hello",
+        tools: [{ type: "namespace", name: identity.namespace, tools: [{ ...tools[0], name: identity.name }] }] }),
+    }))
+    expect(response.status).toBe(200)
+    return response.json()
+  }))
+  for (const [index, response] of responses.entries()) expect(response.output[0]).toMatchObject(identities[index])
 })

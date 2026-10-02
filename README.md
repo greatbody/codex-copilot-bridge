@@ -148,6 +148,8 @@ For `gpt-5.6-sol`, Codex `service_tier="fast"`, `"priority"`, and `"ultrafast"` 
 
 The Chat adapter accepts string input or full message history, instructions/developer messages, text and user image parts, function tools and parallel tool-result continuation. It maps `max_output_tokens` to `max_tokens`, advertised `reasoning.effort` to `reasoning_effort`, and Responses text/JSON output formats to Chat `response_format`. Unsupported reasoning efforts and unrepresentable input parts return HTTP 400 before contacting Copilot.
 
+Responses `namespace` declarations containing function tools are flattened into request-local Chat aliases. Namespace and function descriptions are retained, aliases handle name collisions and Chat's 64-character limit, and JSON/SSE calls restore the original function `name` and `namespace`. Full-history replay and forced function choices use the same mapping, including historical calls whose tools are no longer declared. Plain function names remain unchanged when Chat-compatible. Deferred tools and unsupported namespace members return HTTP 400; tool search is not emulated.
+
 Non-streaming responses map assistant text, refusals, function calls and token usage into Responses output. Streaming conversion emits Responses lifecycle, content and function-argument events with stable request-local response/item identities, original tool `call_id`s and monotonic sequence numbers. Usage-only chunks are retained. Token-limit and content-filter finishes emit `response.incomplete`, not `response.completed`; upstream SSE errors emit `response.failed`. Missing finish reasons, malformed events and truncated streams fail rather than fabricating a completed response. UTF-8 and LF/CRLF/CR SSE framing are incremental, individual frames are bounded to 16 MiB, and cancellation/backpressure propagate upstream.
 
 This adapter is stateless: use full `input` history, not `previous_response_id`, `conversation` or background execution. Historical reasoning items are not replayed. Hosted `web_search*` and `image_generation` declarations are filtered; forcing an unavailable hosted tool is rejected. Completed historical search records and citations are retained as labeled external data, but the adapter does not execute hosted search. Other unrepresentable tool types are rejected.
@@ -155,6 +157,8 @@ This adapter is stateless: use full `input` history, not `previous_response_id`,
 Chat-backed models are included in `/v1/models` and the `models` CLI. The existing `ghcodex` native-Responses picker and `claudex` Messages picker remain unchanged; use an explicit Responses provider/model configuration when invoking a Chat-backed model.
 
 Local live verification on 2026-10-02 used an ephemeral source bridge with Gemini 3.8 Flash. Non-streaming text, a streamed forced function call and a full-history tool-result follow-up all completed successfully. Discovery included Gemini 3.5, 3.6, 3.7 and 3.8 Flash; inference on the other three models was not tested. These local checks do not establish hosted bridge or Sub2API deployment; production verification is recorded separately.
+
+Local namespace verification on 2026-10-03 (Asia/Shanghai) used an ephemeral source bridge with Gemini 3.8 Flash: forced namespaced calls completed in both JSON and SSE modes with the original identity restored, and a full-history tool-result follow-up completed successfully. This verifies the source fix against Copilot, not deployment to a hosted bridge.
 
 ### Native SSE Identities
 

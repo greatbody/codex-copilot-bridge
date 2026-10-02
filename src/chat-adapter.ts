@@ -1,14 +1,18 @@
+import { createHash } from "node:crypto"
 import { positiveInteger, reasoningEfforts, type CopilotModel } from "./copilot"
 
 type JsonObject = Record<string, unknown>
-type AdapterResult<T> = { ok: true; value: T } | { ok: false; status: number; message: string }
+type AdapterError = { ok: false; status: number; message: string }
+type AdapterResult<T> = { ok: true; value: T } | AdapterError
 type ChatMessage = { role: string; content: unknown; tool_calls?: JsonObject[]; tool_call_id?: string }
+export type ChatToolNames = Map<string, { name: string; namespace?: string }>
+type ChatRequestResult = { ok: true; value: JsonObject; toolNames: ChatToolNames } | AdapterError
 
 function object(value: unknown): value is JsonObject {
   return value !== null && typeof value === "object" && !Array.isArray(value)
 }
 
-function invalid(message: string): AdapterResult<never> {
+function invalid(message: string): AdapterError {
   return { ok: false, status: 400, message }
 }
 
@@ -37,11 +41,81 @@ function contentParts(content: unknown, role: string): AdapterResult<unknown> {
   return { ok: true, value: parts.every(part => part.type === "text") ? parts.map(part => part.text).join("") : parts }
 }
 
-export function responsesToChatCompletions(body: JsonObject, model: CopilotModel): AdapterResult<JsonObject> {
+export function responsesToChatCompletions(body: JsonObject, model: CopilotModel): ChatRequestResult {
   if (body.previous_response_id || body.conversation || body.background === true) {
     return invalid("Chat adapter is stateless: send the full input history without previous_response_id, conversation or background.")
   }
   if (body.stream !== undefined && typeof body.stream !== "boolean") return invalid("Responses stream must be a boolean.")
+  const input = typeof body.input === "string" ? [{ role: "user", content: body.input }] : body.input
+  if (!Array.isArray(input)) return invalid("Chat adapter expects input to be a string or an array.")
+  if (body.tools !== undefined && !Array.isArray(body.tools)) return invalid("Responses tools must be an array.")
+  const declarations = (body.tools ?? []) as unknown[]
+  const reservedNames = new Set<string>()
+  for (const item of [...declarations, ...input]) {
+    if (object(item) && ["function", "function_call"].includes(String(item.type)) &&
+      item.namespace == null && typeof item.name === "string") reservedNames.add(item.name)
+  }
+  const toolNames: ChatToolNames = new Map()
+  const aliases = new Map<string, string>()
+  const tools: JsonObject[] = []
+  const declaredNames = new Set<string>()
+
+  // Chat has one flat tool-name space. Keep its aliases request-local so every
+  // JSON/SSE call and replayed history item retains the Responses namespace.
+  function chatName(name: string, namespace?: string) {
+    const key = JSON.stringify([namespace ?? null, name])
+    const existing = aliases.get(key)
+    if (existing !== undefined) return existing
+    const preferred = namespace === undefined ? name : `${namespace}__${name}`
+    let alias = preferred
+    let attempt = 0
+    while (!/^[a-zA-Z0-9_-]{1,64}$/.test(alias) || toolNames.has(alias) ||
+      (namespace !== undefined && reservedNames.has(alias))) {
+      const hash = createHash("sha256").update(JSON.stringify([key, attempt++])).digest("hex").slice(0, 16)
+      alias = `${preferred.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 47)}_${hash}`
+    }
+    aliases.set(key, alias)
+    toolNames.set(alias, { name, ...(namespace === undefined ? {} : { namespace }) })
+    return alias
+  }
+
+  function addFunction(tool: unknown, namespace?: string, description?: string): AdapterResult<void> {
+    if (!object(tool)) return invalid("Chat adapter received a malformed tool.")
+    if (tool.type !== "function" || typeof tool.name !== "string" || !tool.name) {
+      return invalid(`Chat adapter cannot represent tool '${String(tool.type)}'.`)
+    }
+    if (tool.defer_loading !== undefined && tool.defer_loading !== false) {
+      return invalid("Chat adapter cannot represent deferred function tools.")
+    }
+    const name = chatName(tool.name, namespace)
+    if (declaredNames.has(name)) return invalid("Chat adapter received duplicate function tools.")
+    declaredNames.add(name)
+    const { type, defer_loading, ...fn } = tool
+    if (description) {
+      if (fn.description !== undefined && typeof fn.description !== "string") return invalid("Function description must be a string.")
+      fn.description = [description, fn.description].filter(Boolean).join("\n")
+    }
+    tools.push({ type, function: { ...fn, name } })
+    return { ok: true, value: undefined }
+  }
+
+  for (const tool of declarations) {
+    if (!object(tool)) return invalid("Chat adapter received a malformed tool.")
+    // Match the Messages adapter: hosted search/image execution is unavailable.
+    if (tool.type === "image_generation" || String(tool.type).startsWith("web_search")) continue
+    if (tool.type === "namespace") {
+      if (typeof tool.name !== "string" || !tool.name || !Array.isArray(tool.tools) ||
+        (tool.description !== undefined && typeof tool.description !== "string")) return invalid("Chat adapter received a malformed namespace tool.")
+      for (const fn of tool.tools) {
+        const result = addFunction(fn, tool.name, tool.description as string | undefined)
+        if (!result.ok) return result
+      }
+    } else {
+      const result = addFunction(tool)
+      if (!result.ok) return result
+    }
+  }
+
   const messages: ChatMessage[] = []
   if (body.instructions !== undefined && body.instructions !== null) {
     if (typeof body.instructions !== "string") return invalid("Responses instructions must be a string.")
@@ -51,8 +125,6 @@ export function responsesToChatCompletions(body: JsonObject, model: CopilotModel
     if (typeof body.system !== "string") return invalid("Chat adapter expects system to be a string.")
     messages.push({ role: "system", content: body.system })
   }
-  const input = typeof body.input === "string" ? [{ role: "user", content: body.input }] : body.input
-  if (!Array.isArray(input)) return invalid("Chat adapter expects input to be a string or an array.")
   for (const item of input) {
     if (!object(item)) return invalid("Chat adapter received a malformed input item.")
     if (item.type === "reasoning" || item.type === "encrypted_reasoning") continue
@@ -68,7 +140,9 @@ export function responsesToChatCompletions(body: JsonObject, model: CopilotModel
       if (typeof item.call_id !== "string" || !item.call_id || typeof item.name !== "string" || !item.name || typeof item.arguments !== "string") {
         return invalid("Chat adapter expects function_call items with call_id, name and string arguments.")
       }
-      const tool = { id: item.call_id, type: "function", function: { name: item.name, arguments: item.arguments } }
+      if (item.namespace != null && (typeof item.namespace !== "string" || !item.namespace)) return invalid("Function call namespace must be a nonempty string.")
+      const name = chatName(item.name, typeof item.namespace === "string" ? item.namespace : undefined)
+      const tool = { id: item.call_id, type: "function", function: { name, arguments: item.arguments } }
       const previous = messages.at(-1)
       if (previous?.role === "assistant") (previous.tool_calls ??= []).push(tool)
       else messages.push({ role: "assistant", content: null, tool_calls: [tool] })
@@ -108,23 +182,15 @@ export function responsesToChatCompletions(body: JsonObject, model: CopilotModel
       request.reasoning_effort = body.reasoning.effort
     }
   }
-  if (body.tools !== undefined) {
-    if (!Array.isArray(body.tools)) return invalid("Responses tools must be an array.")
-    const tools: JsonObject[] = []
-    for (const tool of body.tools) {
-      if (!object(tool)) return invalid("Chat adapter received a malformed tool.")
-      // Match the Messages adapter: hosted search/image execution is unavailable.
-      if (tool.type === "image_generation" || String(tool.type).startsWith("web_search")) continue
-      if (tool.type !== "function" || typeof tool.name !== "string" || !tool.name) return invalid(`Chat adapter cannot represent tool '${String(tool.type)}'.`)
-      const { type, ...fn } = tool
-      tools.push({ type, function: fn })
-    }
-    if (tools.length) request.tools = tools
-  }
+  if (tools.length) request.tools = tools
   if (body.tool_choice !== undefined) {
     if (typeof body.tool_choice === "string" && ["auto", "none", "required"].includes(body.tool_choice)) request.tool_choice = body.tool_choice
     else if (object(body.tool_choice) && body.tool_choice.type === "function" && typeof body.tool_choice.name === "string") {
-      request.tool_choice = { type: "function", function: { name: body.tool_choice.name } }
+      if (!body.tool_choice.name || (body.tool_choice.namespace != null &&
+        (typeof body.tool_choice.namespace !== "string" || !body.tool_choice.namespace))) return invalid("Forced function tool must have a valid name and namespace.")
+      request.tool_choice = { type: "function", function: {
+        name: chatName(body.tool_choice.name, typeof body.tool_choice.namespace === "string" ? body.tool_choice.namespace : undefined),
+      } }
     } else return invalid("Chat adapter cannot represent the requested tool_choice (including forced hosted tools).")
     const tools = request.tools as JsonObject[] | undefined
     if ((request.tool_choice === "required" || object(request.tool_choice)) && !tools?.length) return invalid("Forced tool choice requires function tools.")
@@ -147,11 +213,11 @@ export function responsesToChatCompletions(body: JsonObject, model: CopilotModel
       } else return invalid("Chat adapter cannot represent text.format.")
     }
   }
-  return { ok: true, value: request }
+  return { ok: true, value: request, toolNames }
 }
 
 type MessageItem = { type: "message"; id: string; role: "assistant"; status: string; content: Array<{ type: "output_text"; text: string; annotations: unknown[] } | { type: "refusal"; refusal: string }> }
-type ToolItem = { type: "function_call"; id: string; call_id: string; name: string; arguments: string; status: string }
+type ToolItem = { type: "function_call"; id: string; call_id: string; name: string; namespace?: string; arguments: string; status: string }
 type OutputItem = MessageItem | ToolItem
 
 function responseUsage(usage: JsonObject) {
@@ -186,7 +252,7 @@ function finishReason(value: unknown): string {
   return value
 }
 
-export function chatCompletionsToResponses(body: unknown, fallbackModel: string) {
+export function chatCompletionsToResponses(body: unknown, fallbackModel: string, toolNames?: ChatToolNames) {
   if (!object(body) || !Array.isArray(body.choices) || body.choices.length !== 1 || !object(body.choices[0]) || !object(body.choices[0].message)) {
     throw new Error("Chat completion returned an invalid single-choice response.")
   }
@@ -206,21 +272,22 @@ export function chatCompletionsToResponses(body: unknown, fallbackModel: string)
         !object(tool.function) || typeof tool.function.name !== "string" || !tool.function.name || typeof tool.function.arguments !== "string") {
         throw new Error("Chat completion returned a malformed function call.")
       }
-      output.push({ type: "function_call", id: `fc_${crypto.randomUUID()}`, call_id: tool.id, name: tool.function.name, arguments: tool.function.arguments, status })
+      output.push({ type: "function_call", id: `fc_${crypto.randomUUID()}`, call_id: tool.id,
+        ...(toolNames?.get(tool.function.name) ?? { name: tool.function.name }), arguments: tool.function.arguments, status })
     }
   }
   return responseSnapshot(`resp_${crypto.randomUUID()}`, typeof body.model === "string" ? body.model : fallbackModel, output,
     object(body.usage) ? body.usage : undefined, finish, typeof body.created === "number" ? body.created : undefined)
 }
 
-export function chatStreamToResponsesStream(body: ReadableStream<Uint8Array> | null, fallbackModel: string) {
+export function chatStreamToResponsesStream(body: ReadableStream<Uint8Array> | null, fallbackModel: string, toolNames?: ChatToolNames) {
   if (!body) throw new Error("Chat completion returned an empty stream.")
   const encoder = new TextEncoder()
   const decoder = new TextDecoder("utf-8", { fatal: true })
   const id = `resp_${crypto.randomUUID()}`
   const created = Math.floor(Date.now() / 1000)
   const output: OutputItem[] = []
-  const tools = new Map<number, { item: ToolItem; index: number; announced: boolean }>()
+  const tools = new Map<number, { item: ToolItem; index: number; announced: boolean; chatName: string }>()
   let message: MessageItem | undefined
   let messageIndex = -1
   let model = fallbackModel
@@ -324,7 +391,7 @@ export function chatStreamToResponsesStream(body: ReadableStream<Uint8Array> | n
           if (!state) {
             if (output.length >= 4096) throw new Error("Chat stream exceeds 4096 output items.")
             const item: ToolItem = { type: "function_call", id: `fc_${crypto.randomUUID()}`, call_id: "", name: "", arguments: "", status: "in_progress" }
-            state = { item, index: output.length, announced: false }
+            state = { item, index: output.length, announced: false, chatName: "" }
             tools.set(tool.index as number, state)
             output.push(item)
           }
@@ -334,12 +401,16 @@ export function chatStreamToResponsesStream(body: ReadableStream<Uint8Array> | n
           }
           const fn = object(tool.function) ? tool.function : {}
           if (typeof fn.name === "string") {
-            if (state.announced && fn.name !== state.item.name) throw new Error("Chat stream changed function name.")
-            if (!state.announced) state.item.name += fn.name
+            if (state.announced && fn.name !== state.chatName) throw new Error("Chat stream changed function name.")
+            if (!state.announced) {
+              state.chatName += fn.name
+              state.item.name = state.chatName
+            }
           }
           const args = typeof fn.arguments === "string" ? fn.arguments : ""
           state.item.arguments += args
           if (!state.announced && state.item.call_id && state.item.name) {
+            Object.assign(state.item, toolNames?.get(state.chatName) ?? { name: state.chatName })
             emit(controller, "response.output_item.added", { output_index: state.index, item: { ...state.item, arguments: "" } })
             state.announced = true
             if (state.item.arguments) emit(controller, "response.function_call_arguments.delta", { item_id: state.item.id, output_index: state.index, delta: state.item.arguments })

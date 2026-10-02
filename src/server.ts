@@ -143,11 +143,11 @@ export function createHandler(
               await response.body?.cancel()
               throw new Error("Chat upstream did not return an SSE response.")
             }
-            return new Response(chatStreamToResponsesStream(response.body, converted.value.model as string), {
+            return new Response(chatStreamToResponsesStream(response.body, converted.value.model as string, converted.toolNames), {
               headers: { "content-type": "text/event-stream" },
             })
           }
-          return json(chatCompletionsToResponses(await response.json(), converted.value.model as string))
+          return json(chatCompletionsToResponses(await response.json(), converted.value.model as string, converted.toolNames))
         } catch (error) {
           return json({ error: { type: "api_error", code: "chat_adapter_error", message: error instanceof Error ? error.message : "Chat conversion failed." } }, 502)
         }
