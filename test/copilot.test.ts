@@ -22,14 +22,21 @@ describe("selectCopilotEndpoint", () => {
   })
 
   test("returns clear unsupported selections", () => {
-    expect(selectCopilotEndpoint([{ id: "legacy", supported_endpoints: ["/chat/completions"] }], "legacy")).toMatchObject({
+    expect(selectCopilotEndpoint([{ id: "legacy", supported_endpoints: ["/embeddings"] }], "legacy")).toMatchObject({
       kind: "unsupported",
-      message: expect.stringContaining("does not support /responses or /v1/messages"),
+      message: expect.stringContaining("does not support /responses, /v1/messages or /chat/completions"),
     })
     expect(selectCopilotEndpoint([], "missing")).toMatchObject({
       kind: "unsupported",
       message: expect.stringContaining("was not found"),
     })
+  })
+
+  test("selects Chat Completions only after native Responses and Messages", () => {
+    expect(selectCopilotEndpoint([{ id: "gemini", supported_endpoints: ["/chat/completions"] }], "gemini").kind).toBe("chat")
+    expect(selectCopilotEndpoint([{ id: "gemini", supported_endpoints: ["/v1/chat/completions"] }], "gemini").kind).toBe("chat")
+    expect(selectCopilotEndpoint([{ id: "gpt", supported_endpoints: ["/chat/completions", "/responses"] }], "gpt").kind).toBe("responses")
+    expect(selectCopilotEndpoint([{ id: "claude", supported_endpoints: ["/chat/completions", "/v1/messages"] }], "claude").kind).toBe("messages")
   })
 })
 
@@ -165,7 +172,7 @@ describe("buildCodexModels", () => {
       { id: "messages", supported_endpoints: ["/v1/messages"], model_picker_enabled: true },
     ])
 
-    expect(models.map((item) => item.id)).toEqual(["messages"])
+    expect(models.map((item) => item.id)).toEqual(["chat-only", "messages"])
   })
 })
 

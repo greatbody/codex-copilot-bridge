@@ -5,6 +5,7 @@ import { rewriteCopilotFastResponsesRequest, sanitizeResponsesBody } from "./res
 import { AnthropicReasoningCache } from "./reasoning-cache"
 import { version } from "../package.json"
 import { normalizeCopilotResponsesStream } from "./responses-stream"
+import { chatCompletionsToResponses, chatStreamToResponsesStream, responsesToChatCompletions } from "./chat-adapter"
 
 const baseURL = "https://api.githubcopilot.com"
 const apiVersion = "2026-06-01"
@@ -119,6 +120,37 @@ export function createHandler(
       const selection = selectCopilotEndpoint(models, body.model)
       if (selection.kind === "unsupported") {
         return json({ error: { message: selection.message } }, selection.model ? 400 : 404)
+      }
+
+      if (selection.kind === "chat") {
+        const converted = responsesToChatCompletions(body, selection.model)
+        if (!converted.ok) return json({ error: { type: "invalid_request_error", code: "chat_adapter_error", message: converted.message } }, converted.status)
+        const response = await fetchUpstream(`${resolvedBaseURL}/chat/completions`, {
+          method: "POST",
+          headers: { "content-type": "application/json", accept: converted.value.stream ? "text/event-stream" : "application/json" },
+          body: JSON.stringify(converted.value),
+          signal: request.signal,
+        })
+        if (!response.ok) {
+          const headers = new Headers(response.headers)
+          headers.delete("content-encoding")
+          headers.delete("content-length")
+          return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
+        }
+        try {
+          if (converted.value.stream) {
+            if (response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase() !== "text/event-stream") {
+              await response.body?.cancel()
+              throw new Error("Chat upstream did not return an SSE response.")
+            }
+            return new Response(chatStreamToResponsesStream(response.body, converted.value.model as string), {
+              headers: { "content-type": "text/event-stream" },
+            })
+          }
+          return json(chatCompletionsToResponses(await response.json(), converted.value.model as string))
+        } catch (error) {
+          return json({ error: { type: "api_error", code: "chat_adapter_error", message: error instanceof Error ? error.message : "Chat conversion failed." } }, 502)
+        }
       }
 
       if (selection.kind === "messages") {

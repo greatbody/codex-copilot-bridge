@@ -139,9 +139,22 @@ Codex should be configured with `wire_api="responses"`. For each `POST /v1/respo
 
 - Models that advertise native `/responses` support are forwarded to Copilot's `/responses` endpoint. Successful SSE responses have their protocol identities normalized as described below. The existing request sanitization still removes `image_generation` tools before forwarding.
 - Models that do not advertise `/responses` but do advertise `/v1/messages` are handled by the local Claude Messages adapter. This is Responses compatibility via translation, not native Claude Responses support.
-- Models that advertise neither endpoint return a JSON error explaining the supported endpoints reported by Copilot.
+- Models that advertise neither of those endpoints but do advertise `/chat/completions` (or `/v1/chat/completions`) use the local Chat Completions adapter, including Copilot Gemini models. The bridge converts the incoming Responses request to Copilot's `/chat/completions` and converts JSON or SSE output back to Responses.
+- Models that advertise none of these supported endpoints return a JSON error explaining the endpoints reported by Copilot.
 
 For `gpt-5.6-sol`, Codex `service_tier="fast"`, `"priority"`, and `"ultrafast"` requests are routed to Copilot's `gpt-5.6-sol-fast` model ID with the unsupported `service_tier` field removed. Copilot serves this route as Fast/Priority processing; the bridge does not claim native Ultrafast service from Copilot.
+
+### Chat Completions Adapter
+
+The Chat adapter accepts string input or full message history, instructions/developer messages, text and user image parts, function tools and parallel tool-result continuation. It maps `max_output_tokens` to `max_tokens`, advertised `reasoning.effort` to `reasoning_effort`, and Responses text/JSON output formats to Chat `response_format`. Unsupported reasoning efforts and unrepresentable input parts return HTTP 400 before contacting Copilot.
+
+Non-streaming responses map assistant text, refusals, function calls and token usage into Responses output. Streaming conversion emits Responses lifecycle, content and function-argument events with stable request-local response/item identities, original tool `call_id`s and monotonic sequence numbers. Usage-only chunks are retained. Token-limit and content-filter finishes emit `response.incomplete`, not `response.completed`; upstream SSE errors emit `response.failed`. Missing finish reasons, malformed events and truncated streams fail rather than fabricating a completed response. UTF-8 and LF/CRLF/CR SSE framing are incremental, individual frames are bounded to 16 MiB, and cancellation/backpressure propagate upstream.
+
+This adapter is stateless: use full `input` history, not `previous_response_id`, `conversation` or background execution. Historical reasoning items are not replayed. Hosted `web_search*` and `image_generation` declarations are filtered; forcing an unavailable hosted tool is rejected. Completed historical search records and citations are retained as labeled external data, but the adapter does not execute hosted search. Other unrepresentable tool types are rejected.
+
+Chat-backed models are included in `/v1/models` and the `models` CLI. The existing `ghcodex` native-Responses picker and `claudex` Messages picker remain unchanged; use an explicit Responses provider/model configuration when invoking a Chat-backed model.
+
+Local live verification on 2026-10-02 used an ephemeral source bridge with Gemini 3.8 Flash. Non-streaming text, a streamed forced function call and a full-history tool-result follow-up all completed successfully. Discovery included Gemini 3.5, 3.6, 3.7 and 3.8 Flash; inference on the other three models was not tested. These local checks do not establish hosted bridge or Sub2API deployment; production verification is recorded separately.
 
 ### Native SSE Identities
 
@@ -203,7 +216,7 @@ The wrappers select separate Codex config profiles by default: `ghcodex` passes 
 
 Profile selection is unchanged, but this is **not full cache isolation**. Both wrappers still read and atomically replace the shared `$CODEX_HOME/models_cache.json` (default `~/.codex/models_cache.json`) with their selected model family. Concurrent wrapper sessions can overwrite each other's model list. Existing cache metadata is preserved rather than migrated.
 
-The bridge builds its Codex model list from Copilot's live `/models` response. If `~/.codex/models_cache.json` contains a template for a live model, the bridge reuses that template and overwrites availability, endpoint, context-window, and token-limit fields from Copilot. Live Copilot models that are not in Codex's cache are exposed dynamically when the bridge can serve them through native `/responses` passthrough or the local Messages adapter.
+The bridge builds its Codex model list from Copilot's live `/models` response. If `~/.codex/models_cache.json` contains a template for a live model, the bridge reuses that template and overwrites availability, endpoint, context-window, and token-limit fields from Copilot. Live Copilot models that are not in Codex's cache are exposed dynamically when the bridge can serve them through native `/responses` passthrough, the local Messages adapter or the Chat Completions adapter.
 
 Model discovery has a five-second timeout, coalesces concurrent requests, and caches results for 30 seconds. Transient refresh failures keep the last successful list and retry after five seconds; the first discovery must succeed. `CODEX_HOME` is respected when reading the model cache.
 

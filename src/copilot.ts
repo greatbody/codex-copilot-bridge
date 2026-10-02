@@ -26,6 +26,7 @@ export type CopilotModel = {
 export type CopilotEndpointSelection =
   | { kind: "responses"; model: CopilotModel }
   | { kind: "messages"; model: CopilotModel }
+  | { kind: "chat"; model: CopilotModel }
   | { kind: "unsupported"; model?: CopilotModel; message: string }
 
 export type CodexModelTemplate = { slug?: string; [key: string]: unknown }
@@ -55,12 +56,13 @@ function normalizeEndpoint(endpoint: string) {
   return value
 }
 
-export function endpointIsSupported(model: CopilotModel | undefined, endpoint: "/responses" | "/v1/messages") {
+export function endpointIsSupported(model: CopilotModel | undefined, endpoint: "/responses" | "/v1/messages" | "/chat/completions") {
   const endpoints = model?.supported_endpoints?.map(normalizeEndpoint) ?? []
   if (endpoint === "/responses") {
     return endpoints.includes("/responses") || endpoints.includes("/v1/responses")
   }
-  return endpoints.includes("/v1/messages") || endpoints.includes("/messages")
+  if (endpoint === "/v1/messages") return endpoints.includes("/v1/messages") || endpoints.includes("/messages")
+  return endpoints.includes("/chat/completions") || endpoints.includes("/v1/chat/completions")
 }
 
 export async function loadCopilotModels(fetchModels: () => Promise<CopilotModel[]>, now = Date.now()) {
@@ -90,7 +92,7 @@ export function clearCopilotModelsCache() {
 function codexModelShape(item: CopilotModel) {
   if (!item.id) return undefined
   if (item.policy?.state === "disabled") return undefined
-  if (!endpointIsSupported(item, "/responses") && !endpointIsSupported(item, "/v1/messages")) return undefined
+  if (!endpointIsSupported(item, "/responses") && !endpointIsSupported(item, "/v1/messages") && !endpointIsSupported(item, "/chat/completions")) return undefined
 
   const supportedReasoningLevels = reasoningEfforts(item).map((effort) => ({
     effort,
@@ -181,12 +183,13 @@ export function selectCopilotEndpoint(models: CopilotModel[], modelID: unknown):
 
   if (endpointIsSupported(model, "/responses")) return { kind: "responses", model }
   if (endpointIsSupported(model, "/v1/messages")) return { kind: "messages", model }
+  if (endpointIsSupported(model, "/chat/completions")) return { kind: "chat", model }
 
   const endpoints = model.supported_endpoints?.length ? model.supported_endpoints.join(", ") : "none"
   return {
     kind: "unsupported",
     model,
-    message: `Copilot model '${modelID}' does not support /responses or /v1/messages. Supported endpoints: ${endpoints}.`,
+    message: `Copilot model '${modelID}' does not support /responses, /v1/messages or /chat/completions. Supported endpoints: ${endpoints}.`,
   }
 }
 
@@ -194,7 +197,7 @@ export function positiveInteger(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined
 }
 
-export function reasoningEfforts(model: CopilotModel, messages = !endpointIsSupported(model, "/responses")): string[] {
+export function reasoningEfforts(model: CopilotModel, messages = !endpointIsSupported(model, "/responses") && endpointIsSupported(model, "/v1/messages")): string[] {
   const supports = model.capabilities?.supports
   const efforts = [...new Set((supports?.reasoning_effort ?? []).filter(effort => typeof effort === "string" && effort.length > 0))]
   if (!messages || supports?.adaptive_thinking) return efforts
