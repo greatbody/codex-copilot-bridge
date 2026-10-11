@@ -1,11 +1,11 @@
-import { createHash } from "node:crypto"
 import { positiveInteger, reasoningEfforts, type CopilotModel } from "./copilot"
+import { createToolNames, type ToolNames } from "./tool-names"
 
 type JsonObject = Record<string, unknown>
 type AdapterError = { ok: false; status: number; message: string }
 type AdapterResult<T> = { ok: true; value: T } | AdapterError
 type ChatMessage = { role: string; content: unknown; tool_calls?: JsonObject[]; tool_call_id?: string }
-export type ChatToolNames = Map<string, { name: string; namespace?: string }>
+export type ChatToolNames = ToolNames
 type ChatRequestResult = { ok: true; value: JsonObject; toolNames: ChatToolNames } | AdapterError
 
 function object(value: unknown): value is JsonObject {
@@ -55,29 +55,9 @@ export function responsesToChatCompletions(body: JsonObject, model: CopilotModel
     if (object(item) && ["function", "function_call"].includes(String(item.type)) &&
       item.namespace == null && typeof item.name === "string") reservedNames.add(item.name)
   }
-  const toolNames: ChatToolNames = new Map()
-  const aliases = new Map<string, string>()
+  const { toolNames, name: chatName } = createToolNames(reservedNames)
   const tools: JsonObject[] = []
   const declaredNames = new Set<string>()
-
-  // Chat has one flat tool-name space. Keep its aliases request-local so every
-  // JSON/SSE call and replayed history item retains the Responses namespace.
-  function chatName(name: string, namespace?: string) {
-    const key = JSON.stringify([namespace ?? null, name])
-    const existing = aliases.get(key)
-    if (existing !== undefined) return existing
-    const preferred = namespace === undefined ? name : `${namespace}__${name}`
-    let alias = preferred
-    let attempt = 0
-    while (!/^[a-zA-Z0-9_-]{1,64}$/.test(alias) || toolNames.has(alias) ||
-      (namespace !== undefined && reservedNames.has(alias))) {
-      const hash = createHash("sha256").update(JSON.stringify([key, attempt++])).digest("hex").slice(0, 16)
-      alias = `${preferred.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 47)}_${hash}`
-    }
-    aliases.set(key, alias)
-    toolNames.set(alias, { name, ...(namespace === undefined ? {} : { namespace }) })
-    return alias
-  }
 
   function addFunction(tool: unknown, namespace?: string, description?: string): AdapterResult<void> {
     if (!object(tool)) return invalid("Chat adapter received a malformed tool.")

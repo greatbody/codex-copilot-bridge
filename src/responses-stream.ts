@@ -22,7 +22,7 @@ const itemEvents = new Set(Object.entries({
 
 // Keep Responses SSE intact, but use output positions rather than Copilot's rotating IDs.
 // In particular, do not rewrite call_id, encrypted_content, or IDs inside annotations.
-export function normalizeCopilotResponsesStream(body: ReadableStream<Uint8Array>) {
+export function normalizeCopilotResponsesStream(body: ReadableStream<Uint8Array>, adapt?: (event: ObjectValue) => ObjectValue[]) {
   const items = new Map<number, ItemIdentity>()
   const aliases = new Map<string, number>()
   let responseID: string | undefined
@@ -128,12 +128,18 @@ export function normalizeCopilotResponsesStream(body: ReadableStream<Uint8Array>
     if (!object(parsed)) return original
     const before = JSON.stringify(parsed)
     normalize(parsed)
-    const after = JSON.stringify(parsed)
-    if (before === after) return original
+    const events = adapt ? adapt(parsed) : [parsed]
+    const serialized = events.map(event => ({ event, json: JSON.stringify(event) }))
+    if (serialized.length === 1 && before === serialized[0].json) return original
     // Keep all non-data fields, comments, and line endings; multiline data is one JSON value.
     const first = data[0]
     const rest = new Set(data.slice(1))
-    return lines.map((line, index) => index === first ? `${firstLine && index === 0 && line.text.startsWith("\uFEFF") ? "\uFEFF" : ""}data: ${after}${line.ending}` : rest.has(index) ? "" : line.text + line.ending).join("")
+    return serialized.map(({ event, json }) => lines.map((line, index) => {
+      if (index === first) return `${firstLine && index === 0 && line.text.startsWith("\uFEFF") ? "\uFEFF" : ""}data: ${json}${line.ending}`
+      if (rest.has(index)) return ""
+      if (adapt && line.text.startsWith("event:") && typeof event.type === "string") return `event: ${event.type}${line.ending}`
+      return line.text + line.ending
+    }).join("")).join(lines.at(-1)?.text === "" ? "" : "\n\n")
   }
 
   function consume(text: string, controller: TransformStreamDefaultController<Uint8Array>, end = false) {

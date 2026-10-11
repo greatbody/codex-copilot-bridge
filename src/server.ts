@@ -6,6 +6,7 @@ import { AnthropicReasoningCache } from "./reasoning-cache"
 import { version } from "../package.json"
 import { normalizeCopilotResponsesStream } from "./responses-stream"
 import { chatCompletionsToResponses, chatStreamToResponsesStream, responsesToChatCompletions } from "./chat-adapter"
+import { adaptGrokTools } from "./grok-tools"
 
 const baseURL = "https://api.githubcopilot.com"
 const apiVersion = "2026-06-01"
@@ -191,23 +192,40 @@ export function createHandler(
         return json(anthropicToResponses(await response.json(), converted.value.model, observe))
       }
 
+      let grok: ReturnType<typeof adaptGrokTools> | undefined
+      if (typeof body.model === "string" && body.model.startsWith("grok-")) {
+        try {
+          grok = adaptGrokTools(body)
+        } catch (error) {
+          return json({ error: { type: "invalid_request_error", code: "grok_tool_adapter_error",
+            message: error instanceof Error ? error.message : "Grok tool conversion failed." } }, 400)
+        }
+      }
       const response = await fetchUpstream(`${resolvedBaseURL}/responses`, {
         method: "POST",
         headers: {
           "content-type": request.headers.get("content-type") || "application/json",
           accept: request.headers.get("accept") || "text/event-stream",
         },
-        body: sanitizeResponsesBody(JSON.stringify(body)),
+        body: sanitizeResponsesBody(JSON.stringify(grok?.request ?? body)),
         signal: request.signal,
       })
       const headers = new Headers(response.headers)
       headers.delete("content-encoding")
       headers.delete("content-length")
       const sse = response.ok && response.body && headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase() === "text/event-stream"
-      if (sse) {
+      if (sse || (grok && response.ok)) {
         for (const header of ["etag", "content-md5", "digest", "content-digest", "repr-digest", "accept-ranges", "content-range"]) headers.delete(header)
       }
-      return new Response(sse ? normalizeCopilotResponsesStream(response.body!) : response.body, {
+      if (grok && response.ok && !sse) {
+        try {
+          return json(grok.response(await response.json()), response.status, headers)
+        } catch (error) {
+          return json({ error: { type: "api_error", code: "grok_tool_adapter_error",
+            message: error instanceof Error ? error.message : "Grok response conversion failed." } }, 502)
+        }
+      }
+      return new Response(sse ? normalizeCopilotResponsesStream(response.body!, grok?.event) : response.body, {
         status: response.status,
         statusText: response.statusText,
         headers,

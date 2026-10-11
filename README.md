@@ -33,6 +33,20 @@ Windows and Linux musl (including Alpine) are not supported. No Docker image or 
 - The bridge is intended for local use on `127.0.0.1`.
 - Review GitHub Copilot terms and your plan limits before using this with automation.
 
+## Grok Tools
+
+For Grok models using Responses, the bridge flattens namespace tools and wraps
+freeform custom tools such as `apply_patch` as string-input functions. JSON and
+streaming responses restore the original tool identities, and full-history
+continuation preserves tool call IDs. Custom grammar is provided as guidance,
+not enforced by the upstream; the client still validates and executes tool input.
+
+Grok does not support Copilot's hosted web search or image generation tools.
+Those declarations are omitted, as in the existing Chat/Messages adapters.
+Use a client-side function or MCP tool for search instead. Forced hosted-tool
+choices and deferred tool loading are rejected. Send full input history rather
+than `previous_response_id` or a server-side conversation.
+
 ## Install
 
 ### Homebrew
